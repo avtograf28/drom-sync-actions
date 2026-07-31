@@ -9,7 +9,7 @@
 
 ## Как это работает
 
-- `.github/workflows/sync.yml` — cron `*/15 * * * *` + ручной запуск (`workflow_dispatch`).
+- `.github/workflows/sync.yml` — запускается только по `workflow_dispatch` (извне и вручную).
 - `npm run build` — esbuild собирает `scripts/drom-sync.mjs` в один файл
   `dist/drom-sync.bundle.mjs`. Баннер `createRequire` обязателен, иначе ESM-бандл падает на
   `Dynamic require of "buffer"` (зависимость использует динамический require).
@@ -60,5 +60,7 @@ DROM_CATALOG_URL=... SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... node dist/dr
 
 ## Расписание
 
-GitHub отключает cron у неактивных репозиториев примерно через 60 дней — если прогоны
-прекратятся, любой коммит или ручной запуск возобновит их.
+Родной cron GitHub Actions не используется (ненадёжен). Запуск идёт **извне** через
+`workflow_dispatch`: внешний планировщик (systemd-таймер на нашем сервере) по расписанию дёргает
+GitHub API и стартует workflow. При необходимости прогон можно запустить вручную из вкладки
+**Actions** → **Run workflow**.

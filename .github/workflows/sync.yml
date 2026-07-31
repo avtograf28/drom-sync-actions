@@ -1,9 +1,9 @@
 name: drom-sync
 
 on:
-  schedule:
-    - cron: '*/15 * * * *'   # каждые 15 минут (best-effort; GitHub может задерживать под нагрузкой)
-  workflow_dispatch: {}        # ручной запуск из вкладки Actions
+  # Расписанием управляет systemd-таймер на VPS-A через GitHub API (workflow_dispatch).
+  # Родной cron не используется — он ненадёжен и создавал бы второй источник запусков.
+  workflow_dispatch: {}        # запуск извне (планировщик VPS-A) и вручную из вкладки Actions
 
 # Не запускать два прогона одновременно (курсор круга в app_settings — общий).
 concurrency:
