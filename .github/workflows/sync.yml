@@ -29,6 +29,9 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           DROM_CATALOG_URL: ${{ secrets.DROM_CATALOG_URL }}
+          # IP хоста базы для проверок в обход DNS. Задать в Settings → Variables (не Secret,
+          # иначе замаскируется в выводе). Если не задан — возьмём из публичного резолва.
+          DB_HOST_IP: ${{ vars.DB_HOST_IP }}
         run: |
           set +e
           HOST=$(printf '%s' "$SUPABASE_URL" | sed -E 's#^[a-z]+://##; s#/.*##')
@@ -46,6 +49,35 @@ jobs:
           probe "DB root     " "$SUPABASE_URL/"
           probe "DB /rest/v1/" "$SUPABASE_URL/rest/v1/"
           probe "catalog     " "$DROM_CATALOG_URL"
+
+          # --- отличить проблему DNS от проблемы доступности ---
+          if ! command -v dig >/dev/null 2>&1; then
+            sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq dnsutils >/dev/null 2>&1 || echo "dig поставить не удалось"
+          fi
+          echo "--- публичные резолверы ($HOST) ---"
+          if command -v dig >/dev/null 2>&1; then
+            for R in 8.8.8.8 1.1.1.1; do
+              echo "@$R: $(dig +short "$HOST" @"$R" 2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+            done
+          else
+            echo "dig недоступен — публичный резолв пропущен"
+          fi
+
+          # IP для проверок в обход DNS раннера: сперва из vars.DB_HOST_IP, иначе из публичного резолва.
+          IP="${DB_HOST_IP:-}"
+          if [ -z "$IP" ] && command -v dig >/dev/null 2>&1; then
+            IP=$(dig +short "$HOST" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+          fi
+          if [ -n "$IP" ]; then
+            echo "--- в обход DNS (--resolve $HOST на IP из vars/публичного резолва) ---"
+            out=$(curl -sS -o /dev/null -m 15 -w '%{http_code}' --resolve "$HOST:443:$IP" "$SUPABASE_URL/rest/v1/" 2>/tmp/e); rc=$?
+            [ "$rc" -eq 0 ] && echo "rest via IP: http=$out" || echo "rest via IP: curl-exit=$rc — $(cat /tmp/e)"
+            echo "--- сервер по IP напрямую (curl -k, TLS не проверяем) ---"
+            out=$(curl -sS -k -o /dev/null -m 15 -w '%{http_code}' "https://$IP/" 2>/tmp/e); rc=$?
+            [ "$rc" -eq 0 ] && echo "server by IP: http=$out" || echo "server by IP: curl-exit=$rc — $(cat /tmp/e)"
+          else
+            echo "IP не определён (vars.DB_HOST_IP пуст и публичный резолв ничего не дал) — проверки по IP пропущены"
+          fi
           true
 
       - name: run sync
