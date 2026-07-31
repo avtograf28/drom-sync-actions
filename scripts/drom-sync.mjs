@@ -1256,6 +1256,7 @@ async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBu
   let coversUpdated    = 0
   let coversSkippedOwn = 0
   let coverErrors      = 0
+  const coverDeferred  = new Set()   // id позиций, чья обложка отложена (лимит/ошибка) — id не двигаем
 
   if (!DRY_RUN) {
     const now   = new Date().toISOString()
@@ -1302,10 +1303,8 @@ async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBu
       await supaPatch(supaUrl, key, 'inventory_items', `id=eq.${id}`, { drom_url: newUrl })
     }
 
-    // Записать последний увиденный id обложки Дрома (только изменившиеся; baseline и смена фото)
-    for (const { id, nid } of dromPhotoIdUpdates) {
-      await supaPatch(supaUrl, key, 'inventory_items', `id=eq.${id}`, { drom_photo_id: nid })
-    }
+    // drom_photo_id записывается НИЖЕ — после обработки обложек (см. блок в конце), чтобы не
+    // проставить id позициям, чья обложка отложена из-за исчерпанного лимита/ошибки.
 
     // Insert side_mismatch records via RPC: ON CONFLICT DO NOTHING on partial unique index.
     if (sideMismatches.length > 0) {
@@ -1313,15 +1312,19 @@ async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBu
     }
 
     // Обложки — только если COVERS_ENABLED. При выключенном тумблере на Дром за картинками не
-    // ходим совсем (drom_photo_id выше уже записан — это наша БД). Ошибка одной картинки НЕ
-    // роняет прогон. Считаем ТОЛЬКО реальные скачивания (loaded/updated) и списываем их из
-    // ОБЩЕГО НА ПРОГОН бюджета coverBudget.remaining (передан из onPageComplete, не сбрасывается
-    // между страницами). Между скачиваниями — пауза COVER_DOWNLOAD_DELAY_MS.
+    // ходим совсем (тогда coverDeferred пуст → drom_photo_id ниже пишется всем, как и раньше).
+    // Ошибка одной картинки НЕ роняет прогон. Считаем ТОЛЬКО реальные скачивания (loaded/updated)
+    // и списываем их из ОБЩЕГО НА ПРОГОН бюджета coverBudget.remaining (передан из onPageComplete,
+    // не сбрасывается между страницами). Между скачиваниями — пауза COVER_DOWNLOAD_DELAY_MS.
+    // Позиции, до которых бюджет не дошёл или чьё скачивание упало, кладём в coverDeferred —
+    // им drom_photo_id НЕ проставляем, чтобы вернуться за обложкой на следующем круге.
     if (COVERS_ENABLED) {
+      let budgetExhausted = false
       for (const c of coverCandidates) {
         if (coverBudget.remaining <= 0) {
-          console.log(`  Лимит обложек за прогон (${MAX_COVERS_PER_RUN}) достигнут — остальное на следующий круг`)
-          break
+          budgetExhausted = true
+          coverDeferred.add(c.itemId)   // лимит исчерпан → обложку не тянем, id не двигаем
+          continue
         }
         try {
           const r = await syncCoverForItem(supaUrl, key, c.itemId, c.status, c.photoId, c.savedPhotoId)
@@ -1333,11 +1336,26 @@ async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBu
           } else if (r === 'skipped_own') {
             coversSkippedOwn++
           }
+          // 'skipped'/'skipped_own' — обложка разрешена по правилу, id проставим ниже.
         } catch (e) {
           coverErrors++
+          coverDeferred.add(c.itemId)   // скачивание упало → id не двигаем, повторим на следующем круге
           vwarn(`  ⚠️  Обложка item ${c.itemId} (photo ${c.photoId}): ${e.message}`)
         }
       }
+      if (budgetExhausted) {
+        console.log(`  Лимит обложек за прогон (${MAX_COVERS_PER_RUN}) достигнут — остальное на следующий круг`)
+      }
+    }
+
+    // Записать последний увиденный id обложки Дрома — ТОЛЬКО тем позициям, чья обложка в этом
+    // прогоне разрешена: скачана, либо осознанно пропущена по правилу (свои фото / терминальный
+    // статус / purged_at / обложка уже есть). Отложенным (исчерпан лимит или ошибка скачивания)
+    // id НЕ проставляем — иначе на следующем круге знакомый id заставил бы синк пропустить их
+    // навсегда, и позиция осталась бы без обложки.
+    for (const { id, nid } of dromPhotoIdUpdates) {
+      if (coverDeferred.has(id)) continue
+      await supaPatch(supaUrl, key, 'inventory_items', `id=eq.${id}`, { drom_photo_id: nid })
     }
   } else {
     if (coverCandidates.length > 0) {
