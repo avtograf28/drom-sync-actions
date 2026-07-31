@@ -1,0 +1,30 @@
+name: drom-sync
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # каждые 15 минут (best-effort; GitHub может задерживать под нагрузкой)
+  workflow_dispatch: {}        # ручной запуск из вкладки Actions
+
+# Не запускать два прогона одновременно (курсор круга в app_settings — общий).
+concurrency:
+  group: drom-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+      - run: npm run build
+      - name: run sync
+        run: npm run sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DROM_CATALOG_URL: ${{ secrets.DROM_CATALOG_URL }}
+          DROM_RUN_SOURCE: actions

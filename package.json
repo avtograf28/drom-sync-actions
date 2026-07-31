@@ -1,0 +1,17 @@
+{
+  "name": "drom-catalog-sync",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Синхронизация внешнего каталога товаров с базой CRM по расписанию (GitHub Actions).",
+  "scripts": {
+    "build": "node build.mjs",
+    "sync": "node dist/drom-sync.bundle.mjs"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}
