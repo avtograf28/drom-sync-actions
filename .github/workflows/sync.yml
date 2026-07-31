@@ -21,6 +21,33 @@ jobs:
           node-version: '22'
       - run: npm install --no-audit --no-fund
       - run: npm run build
+
+      # ВРЕМЕННЫЙ шаг диагностики связности с раннера (потом убрать). Секреты не печатает —
+      # только имя хоста (без схемы), коды ответов и текст ошибок curl. Не роняет прогон.
+      - name: connectivity diagnostics (temporary)
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          DROM_CATALOG_URL: ${{ secrets.DROM_CATALOG_URL }}
+        run: |
+          set +e
+          HOST=$(printf '%s' "$SUPABASE_URL" | sed -E 's#^[a-z]+://##; s#/.*##')
+          echo "DB host: $HOST"
+          echo "--- DNS (getent) ---"
+          getent hosts "$HOST" || echo "getent: имя не резолвится"
+          echo "--- DNS (nslookup) ---"
+          if command -v nslookup >/dev/null 2>&1; then nslookup "$HOST" 2>&1; else echo "nslookup не установлен"; fi
+          probe() {  # $1=метка $2=url
+            local out rc
+            out=$(curl -sS -o /dev/null -m 15 -w '%{http_code}' "$2" 2>/tmp/curlerr); rc=$?
+            if [ "$rc" -eq 0 ]; then echo "$1: http=$out"; else echo "$1: curl-exit=$rc — $(cat /tmp/curlerr)"; fi
+          }
+          echo "--- reachability ---"
+          probe "DB root     " "$SUPABASE_URL/"
+          probe "DB /rest/v1/" "$SUPABASE_URL/rest/v1/"
+          probe "catalog     " "$DROM_CATALOG_URL"
+          true
+
       - name: run sync
         run: npm run sync
         env:
