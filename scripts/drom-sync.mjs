@@ -59,6 +59,12 @@ const MAX_HARD_PAGE     = 150      // аварийный потолок: есл�
 const TIMER_INTERVAL_MIN = 30      // шаг таймера systemd (для оценки времени следующей попытки)
 const REQSIG_TTL_MIN     = 120     // reqsig из кэша считаем валидным < 2 ч; иначе принудительный
                                    // разогрев (намерено ≥4 ч стабильности, берём с запасом вдвое)
+// Пауза между кругами: после завершения полного круга новый прогон со страницы 1 откладывается
+// на столько часов. Ставилась под баны Дрома при работе с ПОСТОЯННОГО IP. Здесь синк выполняется
+// на раннерах GitHub с чистых IP — ограничений нет, поэтому 0: новый круг стартует сразу (быстрее
+// находим расхождения и добираем обложки). При 0 проверка ниже не срабатывает. В основном
+// репозитории (резерв на VPS-A, постоянный адрес) значение — 12, там пауза по-прежнему уместна.
+const CYCLE_COOLDOWN_HOURS = 0
 
 // ── Пауза после отказа (состояние в app_settings, переживает рестарты) ────
 // Прогоны идут круглосуточно (каждые 15 мин). Чтобы после отказа не повторять запросы
@@ -1672,12 +1678,13 @@ async function main() {
   // Pre-Phase: determine resume position and check 24h cooldown
   const startPage = await checkLastRun(supaUrl, key)
 
-  if (startPage === 1) {
+  // При CYCLE_COOLDOWN_HOURS === 0 пауза между кругами выключена — проверку не выполняем.
+  if (startPage === 1 && CYCLE_COOLDOWN_HOURS > 0) {
     const completedAt = await getCycleCompleted(supaUrl, key)
     if (completedAt) {
       const hoursAgo = (Date.now() - new Date(completedAt).getTime()) / 3_600_000
-      if (hoursAgo < 12) {
-        const hoursLeft = (12 - hoursAgo).toFixed(1)
+      if (hoursAgo < CYCLE_COOLDOWN_HOURS) {
+        const hoursLeft = (CYCLE_COOLDOWN_HOURS - hoursAgo).toFixed(1)
         console.log(
           `\n⏸  Круг завершён ${hoursAgo.toFixed(1)} ч. назад,` +
           ` следующий начнётся через ${hoursLeft} ч. — пропускаем прогон`
@@ -1865,7 +1872,11 @@ async function main() {
     if (!DRY_RUN) {
       const completedNow = new Date().toISOString()
       await setCycleCompleted(supaUrl, key, completedNow)
-      console.log(`  Круг завершён, следующий — не ранее чем через 12 ч. (${completedNow})`)
+      console.log(
+        CYCLE_COOLDOWN_HOURS > 0
+          ? `  Круг завершён, следующий — не ранее чем через ${CYCLE_COOLDOWN_HOURS} ч. (${completedNow})`
+          : `  Круг завершён, следующий начнётся сразу — пауза между кругами выключена (${completedNow})`
+      )
     }
   }
 
