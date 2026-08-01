@@ -11,15 +11,15 @@
 import { load } from 'cheerio'
 import { readFileSync, existsSync } from 'fs'
 import { join, dirname, resolve } from 'path'
-import { fileURLToPath } from 'url'
+import { fileURLToPath, pathToFileURL } from 'url'
 
 const __dir = dirname(fileURLToPath(import.meta.url))
 const ROOT    = resolve(__dir, '..')
 const DRY_RUN = process.argv.includes('--dry-run')
 
-// Откуда идёт прогон: 'actions' (GitHub Actions) или 'vps-a' (резервный systemd-таймер).
-// Пишется в drom_sync_runs.run_source, чтобы в UI было видно, кто работает. Задаётся через
-// env DROM_RUN_SOURCE; по умолчанию 'vps-a'.
+// Откуда идёт прогон: 'actions' (GitHub Actions, отдельный публичный репо, свежий IP каждый раз)
+// или 'vps-a' (резервный systemd-таймер, постоянный IP). Пишется в drom_sync_runs.run_source,
+// чтобы в UI было видно, кто работает. Задаётся через env DROM_RUN_SOURCE; по умолчанию 'vps-a'.
 const RUN_SOURCE = (process.env.DROM_RUN_SOURCE || 'vps-a').trim().toLowerCase()
 
 // Уровни вывода. Публичный (всегда) — только обезличенное: страницы, счётчики, коды ответов,
@@ -52,34 +52,36 @@ function resolveCatalogUrl() {
 
 const BASE_URL          = resolveCatalogUrl()
 const UA                = 'AvtografCRM-SyncBot/1.0 (+seller Autograf28, daily catalog sync)'
-const MAX_PAGES_PER_RUN = 2        // ограничение страниц за прогон: идём небольшими блоками,
-                                  // чтобы не частить запросами. Полный круг ~41 прогон × 15 мин
-                                  // ≈ ~10 ч (стабильность > скорость)
+const MAX_PAGES_PER_RUN = 3        // ≤3 AJAX-страницы на сессию — запас до лимита Дрома (~4
+                                  // AJAX/сессия, дальше капча). Свежий разогрев каждый прогон
+                                  // (см. fetchAllDromListings): непройденные страницы из чекпоинта
+                                  // попадают в первые запросы свежей сессии, где хвост отдаётся
+                                  // полностью. Полный круг ~82/3 ≈ 28 прогонов × 15 мин ≈ ~7 ч.
 const MAX_HARD_PAGE     = 150      // аварийный потолок: если Дром зациклил пагинацию
 const TIMER_INTERVAL_MIN = 30      // шаг таймера systemd (для оценки времени следующей попытки)
 const REQSIG_TTL_MIN     = 120     // reqsig из кэша считаем валидным < 2 ч; иначе принудительный
                                    // разогрев (намерено ≥4 ч стабильности, берём с запасом вдвое)
 // Пауза между кругами: после завершения полного круга новый прогон со страницы 1 откладывается
-// на столько часов. Ставилась под баны Дрома при работе с ПОСТОЯННОГО IP. Здесь синк выполняется
-// на раннерах GitHub с чистых IP — ограничений нет, поэтому 0: новый круг стартует сразу (быстрее
-// находим расхождения и добираем обложки). При 0 проверка ниже не срабатывает. В основном
-// репозитории (резерв на VPS-A, постоянный адрес) значение — 12, там пауза по-прежнему уместна.
-const CYCLE_COOLDOWN_HOURS = 0
+// на столько часов. Ставилась под баны Дрома при работе с ПОСТОЯННОГО IP. Здесь (VPS-A —
+// резерв, постоянный адрес) пауза уместна, поэтому 12. В заготовке для GitHub Actions стоит 0
+// (раннеры приходят с чистых IP, ограничений нет). При 0 проверка ниже не срабатывает — новый
+// круг стартует сразу (быстрее находим расхождения и добираем обложки).
+const CYCLE_COOLDOWN_HOURS = 12
 
-// ── Пауза после отказа (состояние в app_settings, переживает рестарты) ────
-// Прогоны идут круглосуточно (каждые 15 мин). Чтобы после отказа не повторять запросы
-// слишком часто, пропускаем N ближайших прогонов:
+// ── Backoff при бане Дрома (состояние в app_settings, переживает рестарты) ────
+// Таймер круглосуточный (каждые 15 мин). Чтобы при 403/бане не долбиться 96 раз
+// в сутки и не продлевать бан, после отказа пропускаем N ближайших прогонов:
 //   1-й отказ подряд  → пропустить 2  (следующая попытка ~через 45 мин)
 //   2-й подряд        → пропустить 8  (~2 ч)
 //   3-й и далее       → пропустить 24 (~6 ч)
-// Успешный контакт с сервером обнуляет счётчик.
+// Успешный контакт с Дромом обнуляет счётчик.
 function backoffSkipsFor(failCount) {
   if (failCount <= 1) return 2
   if (failCount === 2) return 8
   return 24
 }
 
-// Бросается при отказе сервера — сигнал сделать паузу перед повтором.
+// Бросается, когда Дром вернул 403 (бан IP) — сигнал для backoff.
 class DromBanError extends Error {
   constructor(status) {
     super(`Drom ban: HTTP ${status}`)
@@ -365,12 +367,13 @@ const COVER_BUCKET      = 'inventory-photos'
 const COVER_SORT_ORDER  = -1
 // Не тянем обложки для терминальных статусов: ретеншн их чистит → был бы пинг-понг.
 const COVER_SKIP_STATUS = new Set(['sold', 'written_off', 'returned'])
-// Пауза между скачиваниями обложек — распределить запросы во времени, а не отправлять их
-// всплеском (обложки лежат на static-хосте того же источника).
+// Пауза между скачиваниями обложек — размазать всплеск запросов к Дрому (static.baza в том же
+// /24, что и каталог; ~95 картинок за прогон переполняли лимит и ловили 403-бан на разогреве).
 const COVER_DOWNLOAD_DELAY_MS = 400
-// Выключатель скачивания обложек. При false обложки НЕ качаются вообще (за картинками наружу
-// не ходим), но drom_photo_id в inventory_items пишется как обычно — это запись в нашу БД.
-// Если понадобится снизить нагрузку на источник — поставить false и пересобрать.
+// Выключатель скачивания обложек. При false обложки НЕ качаются вообще (на Дром за картинками
+// не ходим), но drom_photo_id в inventory_items пишется как обычно — это запись в нашу БД, на
+// Дром не ходит. Включено: баны были из-за IP, а GitHub Actions каждый раз с нового адреса.
+// Если резервный VPS-A (постоянный IP) снова начнёт ловить 403 — поставить false и пересобрать.
 const COVERS_ENABLED = true
 // Потолок скачиваний обложек за ОДИН ПРОГОН (не за страницу!). Бюджет общий на прогон — объект
 // coverBudget создаётся в onPageComplete-скоупе и передаётся в updateExistingItems, поэтому не
@@ -379,7 +382,7 @@ const COVERS_ENABLED = true
 const MAX_COVERS_PER_RUN = 50
 
 // Скачивает полноразмерную обложку {PHOTO_ID}_full (webp 1280×960). Бросает при не-2xx
-// или если пришла не картинка (HTML-заглушка вместо изображения) — чтобы не сохранить HTML под .webp.
+// или если пришла не картинка (антибот-заглушка) — чтобы не сохранить HTML под .webp.
 async function fetchDromImageFull(photoId) {
   const res = await fetch(`https://static.baza.drom.ru/v/${photoId}_full`, {
     headers: { 'User-Agent': UA, 'Referer': BASE_URL },
@@ -529,9 +532,9 @@ async function setSetting(supaUrl, key, k, v) {
 }
 
 // ── reqsig cache (app_settings: drom_reqsig, drom_reqsig_at) ──────────────────
-// Сессия держится на токене reqsig (кук нет). reqsig стабилен ≥4 ч, поэтому кэшируем его и
-// пропускаем разогрев, пока моложе REQSIG_TTL_MIN. Это убирает лишний GET страницы —
-// на один запрос меньше за прогон.
+// Сессия Дрома держится на reqsig + IP (кук нет). reqsig стабилен ≥4 ч, поэтому
+// кэшируем его и пропускаем разогрев, пока моложе REQSIG_TTL_MIN. Это убирает
+// GET страницы юзера — тот самый запрос, что первым ловит бан.
 
 async function getCachedReqsig(supaUrl, key) {
   const rows = await supaGet(
@@ -662,29 +665,29 @@ function isPositionWord(w) {
 
 // Returns side string (e.g. 'F.L', 'R', 'F.R ↑ Верх') or null if undetermined.
 // Scans all tokens — Latin OEM codes won't match Cyrillic regexes, so no false positives.
+//
+// Пара (в названии названы И левая, И правая) сторону НЕ конкретизирует — ориентируемся
+// только на перёд/зад (F или R). Так продаётся, напр., «стойка передняя левая правая» —
+// это перёд (F), а не F.L. Одиночная сторона сохраняется (F.L/F.R/…). Слэши приводим к
+// пробелам, чтобы «левый/правый» и «левая /правая» тоже дали обе стороны (иначе токен со
+// слэшем не матчится LEFT_RE/RIGHT_RE и пара ошибочно схлопывается в одну сторону).
 function parseItemSide(fullName) {
-  const words = fullName.trim().split(/\s+/).filter(Boolean)
+  const words = fullName.replace(/\//g, ' ').trim().split(/\s+/).filter(Boolean)
 
   const firstPos = words.findIndex(isPositionWord)
   if (firstPos === -1) return null
 
   const posWords = words.slice(firstPos)
 
-  const slashToken = posWords.find(w => w.includes('/'))
-  let slashCancelsLR = false
-  if (slashToken) {
-    const parts = slashToken.split('/')
-    if (parts.some(p => LEFT_RE.test(p)) && parts.some(p => RIGHT_RE.test(p))) {
-      slashCancelsLR = true
-    }
-  }
-
   const hasFront = posWords.some(w => FRONT_RE.test(w))
   const hasBack  = posWords.some(w => BACK_RE.test(w))
-  const hasLeft  = !slashCancelsLR && posWords.some(w => LEFT_RE.test(w))
-  const hasRight = !slashCancelsLR && posWords.some(w => RIGHT_RE.test(w))
+  let   hasLeft  = posWords.some(w => LEFT_RE.test(w))
+  let   hasRight = posWords.some(w => RIGHT_RE.test(w))
   const hasUpper = posWords.some(w => UPPER_RE.test(w))
   const hasLower = posWords.some(w => LOWER_RE.test(w))
+
+  // Обе стороны названы (пара) → L/R не уточняем, остаётся только перёд/зад.
+  if (hasLeft && hasRight) { hasLeft = false; hasRight = false }
 
   let base = null
   if      (hasFront && hasLeft)  base = 'F.L'
@@ -709,38 +712,32 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
     ` (блок: страницы ${startPage}–${startPage + MAX_PAGES_PER_RUN - 1})`
   )
 
-  // reqsig: из кэша, если моложе REQSIG_TTL_MIN → разогрев пропускаем. Иначе (нет /
-  // протух / принудительное обновление раз в N часов) — разогрев и сохранение нового.
+  // Свежая сессия на КАЖДЫЙ прогон: reqsig между прогонами НЕ переиспользуем. У Дрома лимит
+  // ~4 AJAX-запроса на сессию; переиспользование reqsig копило запросы одной сессии и глушило
+  // хвост (пустой feed → ложное завершение круга). Разогрев каждый раз кладёт непройденные
+  // страницы (из чекпоинта) в ПЕРВЫЕ запросы свежей сессии, где хвост отдаётся полностью.
   let cookieJar = {}
   let reqsig
-  let freshWarmup = false   // делали ли разогрев в этом прогоне (управляет refresh-логикой ниже)
+  let freshWarmup = true    // всегда свежий разогрев (флаг оставлен для ветки refresh-on-403 ниже)
 
-  const cached = await getCachedReqsig(supaUrl, key)
-  if (cached && cached.ageMin < REQSIG_TTL_MIN) {
-    reqsig = cached.reqsig
-    console.log(`  reqsig из кэша (возраст ${cached.ageMin} мин < ${REQSIG_TTL_MIN}) — разогрев пропущен`)
-  } else {
-    try {
-      const w = await warmupSession()
-      cookieJar   = w.cookieJar
-      reqsig      = w.reqsig
-      freshWarmup = true
-      if (!DRY_RUN) await saveReqsig(supaUrl, key, reqsig)
-      console.log(cached
-        ? `  reqsig протух (${cached.ageMin} мин ≥ ${REQSIG_TTL_MIN}) — обновлён разогревом`
-        : '  reqsig в кэше не было — получен разогревом')
-    } catch (e) {
-      if (e instanceof DromBanError) {
-        console.warn('  ⚠️  403 на разогреве — отказ сервера, пауза до следующей попытки')
-        return {
-          allItems: [], allUnrecognized: [], pagesScanned: 0, completedFull: false,
-          lastPageReached: null, startPage, blockCollisions: [], warmupBanned: true, itemsCount: null,
-        }
+  try {
+    const w = await warmupSession()
+    cookieJar = w.cookieJar
+    reqsig    = w.reqsig
+    if (!DRY_RUN) await saveReqsig(supaUrl, key, reqsig)  // пишем только для наблюдаемости — не читается
+    console.log('  Свежий разогрев — reqsig получен')
+  } catch (e) {
+    if (e instanceof DromBanError) {
+      console.warn('  ⚠️  403 на разогреве — Дром не пустил вообще, включаю backoff')
+      return {
+        allItems: [], allUnrecognized: [], pagesScanned: 0, completedFull: false,
+        lastPageReached: null, startPage, blockCollisions: [], warmupBanned: true, itemsCount: null,
+        completedAtPage: null,
       }
-      throw e
     }
-    await sleep(2000 + Math.random() * 2000)
+    throw e
   }
+  await sleep(2000 + Math.random() * 2000)
 
   const allItems         = []
   const seenNumbers      = new Map()   // internalNumber → first item seen this block
@@ -749,6 +746,7 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
   const allUnrecognized  = []
   let   pagesScanned     = 0
   let   completedFull    = false
+  let   completedAtPage  = null   // номер страницы, на которой круг реально завершился (для guard)
   let   lastPageReached  = null
   let   itemsCount       = null
 
@@ -762,11 +760,10 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
     let stopped    = false   // завершить блок штатно (лимит частоты / ошибка) — не бан
     let midRunBan  = false   // настоящий бан, обнаруженный при refresh-разогреве
 
-    // Получение страницы. Если reqsig был из кэша и сервер отдал отказ/заглушку — считаем
-    // reqsig протухшим, обновляем разогревом и повторяем страницу ОДИН раз. Разогрев тут же
-    // служит проверкой связи: отказ на разогреве = сервер не пускает → пауза (backoff). Если
-    // reqsig уже свежий (разогрев в этом прогоне), повторный отказ = ограничение частоты,
-    // блок завершается штатно.
+    // Получение страницы. Если reqsig был из кэша и Дром отдал 403/заглушку — считаем
+    // reqsig протухшим, обновляем разогревом и повторяем страницу ОДИН раз. Разогрев тут
+    // же служит пробой на бан: 403 на разогреве = настоящий бан → backoff. Если reqsig
+    // уже свежий (разогрев в этом прогоне), 403 = лимит частоты, блок завершается штатно.
     for (;;) {
       let fetchErr = null
       try {
@@ -789,7 +786,7 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
       if (softBad) {
         if (!freshWarmup) {
           // reqsig был из кэша → возможно протух. Обновляем разогревом и пробуем снова.
-          console.warn(`  ⚠️  ${is403 ? '403' : 'получен не тот тип содержимого'} на стр. ${pg} с кэшированным reqsig — обновляю разогревом`)
+          console.warn(`  ⚠️  ${is403 ? '403' : 'антибот-заглушка'} на стр. ${pg} с кэшированным reqsig — обновляю разогревом`)
           try {
             const w = await warmupSession()
             cookieJar   = w.cookieJar
@@ -800,15 +797,15 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
             continue   // повтор той же страницы со свежим reqsig
           } catch (we) {
             if (we instanceof DromBanError) {
-              console.warn('  ⚠️  403 на разогреве при обновлении reqsig — отказ сервера, пауза до следующей попытки')
+              console.warn('  ⚠️  403 на разогреве при обновлении reqsig — настоящий бан, backoff')
               midRunBan = true
               break
             }
             throw we
           }
         }
-        // reqsig уже свежий → это ограничение частоты, не отказ сессии. Завершаем блок штатно.
-        console.warn(`  ⚠️  ${is403 ? '403' : 'получен не тот тип содержимого'} на стр. ${pg} — частота ограничена, блок завершён`)
+        // reqsig уже свежий → это лимит частоты, а не бан. Завершаем блок штатно.
+        console.warn(`  ⚠️  ${is403 ? '403' : 'антибот-заглушка'} на стр. ${pg} — лимит частоты, завершаю блок штатно (не бан)`)
         stopped = true
         break
       }
@@ -817,11 +814,12 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
     }
 
     if (midRunBan) {
-      // Сервер не пускает посреди блока: чекпоинт по успешным страницам уже сохранён,
-      // пауза взводится в main. Дальше блок не продолжаем.
+      // Настоящий бан посреди блока: чекпоинт по успешным страницам уже сохранён,
+      // backoff взводится в main. Дальше блок не продолжаем.
       return {
         allItems, allUnrecognized, pagesScanned, completedFull: false,
         lastPageReached, startPage, blockCollisions, warmupBanned: true, itemsCount,
+        completedAtPage: null,
       }
     }
     if (stopped) break
@@ -844,9 +842,19 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
     const { items, unrecognized } = parseFeed(feedHtml)
 
     if (items.length === 0 && unrecognized.length === 0) {
-      console.log(`  Страница ${pg}: пусто — конец каталога`)
-      completedFull   = true
-      lastPageReached = null  // next run starts from page 1
+      const expectedLast = itemsCount != null ? Math.ceil(itemsCount / 50) : null
+      if (expectedLast != null && pg >= expectedLast - 1) {
+        // Пусто у ОЖИДАЕМОГО конца каталога — настоящий конец.
+        console.log(`  Страница ${pg}: пусто у ожидаемого конца (~${expectedLast}) — конец каталога`)
+        completedFull   = true
+        completedAtPage = pg
+        lastPageReached = null  // next run starts from page 1
+      } else {
+        // Пустой feed ДАЛЕКО от ожидаемого конца = антибот/старвейшн хвоста, НЕ конец каталога.
+        // Мягкий сбой: круг НЕ завершаем (completedFull остаётся false), чекпоинт — на последней
+        // успешной странице; следующий прогон (свежая сессия) добирает эти страницы.
+        console.warn(`  ⚠️  Страница ${pg}: пустой feed далеко от конца (ожидалось ~${expectedLast ?? '?'}) — мягкий сбой (антибот/старвейшн), круг НЕ завершаю`)
+      }
       break
     }
 
@@ -911,6 +919,7 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
     if (itemsCount != null && pg >= Math.ceil(itemsCount / 50)) {
       console.log(`  Достигнут конец каталога (стр. ${pg}) — готово`)
       completedFull   = true
+      completedAtPage = pg
       lastPageReached = null
       break
     }
@@ -925,6 +934,7 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
         `\n   Проверьте структуру каталога baza.drom.ru вручную.`
       )
       completedFull   = true
+      completedAtPage = pg
       lastPageReached = null
       break
     }
@@ -945,9 +955,9 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
 
   const status = completedFull ? '✅ Полный круг завершён' : `⏸  Блок ${startPage}–${lastPageReached ?? startPage} выполнен`
   console.log(`\n📋 Статус: ${status}`)
-  // warmupBanned=false: разогрев прошёл. Даже если внутри блока был отказ/заглушка
-  // (ограничение частоты) — паузу (backoff) не включаем, чекпоинт сохранён.
-  return { allItems, allUnrecognized, pagesScanned, completedFull, lastPageReached, startPage, blockCollisions, warmupBanned: false, itemsCount }
+  // warmupBanned=false: разогрев прошёл. Даже если внутри блока был 403/заглушка
+  // (лимит частоты) — это НЕ бан, backoff не включаем, чекпоинт сохранён.
+  return { allItems, allUnrecognized, pagesScanned, completedFull, lastPageReached, startPage, blockCollisions, warmupBanned: false, itemsCount, completedAtPage }
 }
 
 // ── Phase 2: Load CRM snapshot ────────────────────────────────────────────────
@@ -1094,6 +1104,9 @@ async function importNewItems(supaUrl, key, newItems, crmSnapshot) {
         notes:           null,
         slash_base_id:   null,
         drom_url:        item.url ?? null,
+        // Позиция синка рождается сразу в on_drom, минуя приёмку (единственный путь,
+        // где in_stock_since проставлялся) — момент появления на Дроме и есть «в наличии».
+        in_stock_since:  new Date().toISOString(),
       }
 
       // Merge из pending_purchases: Дром авторитетен для name/side (парсинг),
@@ -1227,11 +1240,20 @@ async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBu
         if (crm.side === null) {
           sideUpdates.push({ id: crm.id, newSide: parsedSide })
         } else if (crm.side !== parsedSide) {
-          sideMismatches.push({
-            inventory_item_id: crm.id,
-            mismatch_type:     'side_mismatch',
-            detail:            { crm_side: crm.side, drom_side: parsedSide },
-          })
+          // «Дром менее конкретен»: сторона с Дрома — база той же оси, что в CRM (Дром дал
+          // 'F', CRM уточняет 'F.R'; или 'F.R' против 'F.R ↑ Верх'). Противоречия по стороне
+          // нет — Дром просто не указал L/R или верх/низ. Не флажим как расхождение (это был
+          // основной источник ложных задач в сверке). Обратный случай — Дром КОНКРЕТНЕЕ или
+          // сторона реально другая (F.R vs F.L, R.R vs F.R) — по-прежнему флажим.
+          const dromLessSpecific =
+            crm.side.startsWith(parsedSide) && crm.side.length > parsedSide.length
+          if (!dromLessSpecific) {
+            sideMismatches.push({
+              inventory_item_id: crm.id,
+              mismatch_type:     'side_mismatch',
+              detail:            { crm_side: crm.side, drom_side: parsedSide },
+            })
+          }
         }
       }
     }
@@ -1451,10 +1473,23 @@ async function protectCounter(supaUrl, key) {
 //   sold_but_listed:   sold/returned/written_off items whose last_seen_at >= cycleStart
 //                      (seen during this cycle → still listed despite being closed in CRM)
 
-async function detectMismatches(supaUrl, key, cycleStart) {
+async function detectMismatches(supaUrl, key, cycleStart, opts = {}) {
   if (!cycleStart) {
     console.warn('  ⚠️  cycleStart не определён — пропуск обнаружения расхождений')
     return { missingFromDrom: 0, soldButListed: 0 }
+  }
+
+  // Предохранитель: не запускать детекцию, если круг завершился заметно РАНЬШЕ ожидаемого конца
+  // (пройдено сильно меньше страниц, чем ceil(itemsCount/50)) — это недосканированный хвост, а
+  // не реальные снятия. Иначе весь непройденный хвост ложно уехал бы в missing_from_drom.
+  const { completedAtPage = null, itemsCount = null } = opts
+  const expectedLast = itemsCount != null ? Math.ceil(itemsCount / 50) : null
+  if (expectedLast != null && completedAtPage != null && completedAtPage < expectedLast - 1) {
+    console.warn(
+      `  ⚠️  Круг завершился на стр. ${completedAtPage}, ожидалось ~${expectedLast} — пройдено ` +
+      `заметно меньше. Пропускаю обнаружение расхождений (вероятно недосканированный хвост).`
+    )
+    return { missingFromDrom: 0, soldButListed: 0, autoClosed: 0, skippedGuard: true }
   }
 
   const missingRows = await supaGet(
@@ -1653,8 +1688,8 @@ async function main() {
   const { url: supaUrl, key } = loadConfig()
   vlog(`🔗 Supabase: ${supaUrl}`)
 
-  // Pre-Phase: backoff-гейт. Если предыдущий прогон получил отказ — пропускаем ближайшие
-  // прогоны, не обращаясь к источнику. Состояние в app_settings, переживает рестарт.
+  // Pre-Phase: backoff-гейт. Если предыдущий прогон поймал 403/бан — пропускаем
+  // ближайшие прогоны, не трогая Дром. Состояние в app_settings, переживает рестарт.
   const backoff = await getBackoff(supaUrl, key)
   if (backoff.skipRemaining > 0) {
     const remainingAfter = backoff.skipRemaining - 1
@@ -1769,12 +1804,12 @@ async function main() {
 
   // Phase 1: scan block (resume from last_page_reached + 1), process each page immediately
   console.log('\n📡 Обход каталога ...')
-  const { allItems, allUnrecognized, pagesScanned, completedFull, lastPageReached, blockCollisions, warmupBanned, itemsCount } =
+  const { allItems, allUnrecognized, pagesScanned, completedFull, lastPageReached, blockCollisions, warmupBanned, itemsCount, completedAtPage } =
     await fetchAllDromListings(supaUrl, key, startPage, onPageComplete)
 
-  // Пауза (backoff) — ТОЛЬКО когда сервер не пустил на разогреве (сессию установить не
-  // удалось). Отказ посреди блока после успешных страниц — это ограничение частоты: сюда он
-  // не приходит (warmupBanned=false), блок завершён штатно, чекпоинт сохранён.
+  // Backoff ТОЛЬКО при бане на разогреве (Дром не пустил вообще). 403 посреди
+  // блока после успешных страниц — это лимит частоты, не бан: он сюда не приходит
+  // (warmupBanned=false), блок завершён штатно, чекпоинт сохранён.
   if (warmupBanned) {
     if (!DRY_RUN) {
       const newFail = backoff.failCount + 1
@@ -1783,18 +1818,18 @@ async function main() {
       await setSetting(supaUrl, key, 'drom_backoff_skip_remaining', skips)
       await setSetting(supaUrl, key, 'drom_backoff_last_403_at',    new Date().toISOString())
       console.warn(
-        `\n🛑 403 на разогреве — отказ сервера, пауза до следующей попытки. Отказов подряд: ${newFail}.` +
+        `\n🛑 403 на разогреве (бан). Отказов подряд: ${newFail}.` +
         ` Пропускаю следующие ${skips} прогонов, следующая попытка примерно в ${nextAttemptEtaUtc(skips)} UTC`
       )
     } else {
-      console.log(`\n🛑 (DRY RUN) 403 на разогреве — отказ сервера; реальный прогон сделал бы паузу (отказ #${backoff.failCount + 1})`)
+      console.log(`\n🛑 (DRY RUN) 403 на разогреве — реальный прогон записал бы backoff (отказ #${backoff.failCount + 1})`)
     }
     process.exit(0)
   }
 
-  // Разогрев прошёл = успешный контакт с источником → сбрасываем backoff, если был активен.
-  // Сюда попадаем в т.ч. когда внутри блока было ограничение частоты: счётчик отказов
-  // обнуляется, как и требуется.
+  // Разогрев прошёл = успешный контакт с Дромом → сбрасываем backoff, если был
+  // активен. Сюда попадаем в т.ч. когда внутри блока был 403 (лимит частоты):
+  // счётчик отказов обнуляется, как и требуется.
   if (!DRY_RUN && (backoff.failCount > 0 || backoff.skipRemaining > 0)) {
     await setSetting(supaUrl, key, 'drom_backoff_fail_count',     0)
     await setSetting(supaUrl, key, 'drom_backoff_skip_remaining', 0)
@@ -1864,7 +1899,7 @@ async function main() {
   let mismatchesSold    = 0
   if (completedFull) {
     console.log('\n🔍 Поиск расхождений...')
-    const result = await detectMismatches(supaUrl, key, cycleStart)
+    const result = await detectMismatches(supaUrl, key, cycleStart, { completedAtPage, itemsCount })
     mismatchesMissing = result.missingFromDrom
     mismatchesSold    = result.soldButListed
     console.log(`  Пропали с Дрома: ${mismatchesMissing}, продано но висит: ${mismatchesSold}, автозакрыто: ${result.autoClosed}`)
@@ -1923,7 +1958,19 @@ async function main() {
   vlog(`   Счётчик после        : ${stats.counterAfter}`)
 }
 
-main().catch(e => {
-  console.error('\n❌ Fatal:', e.message)
-  process.exit(1)
-})
+// Экспорт для переиспользования в scripts/drom-pending-fetch.mjs (добор позиций по номерам
+// из pending_purchases через поиск Дрома). main() запускается ТОЛЬКО при прямом вызове файла
+// (гвард ниже), поэтому импорт из другого скрипта НЕ триггерит полный синк.
+export {
+  loadConfig, warmupSession, parseFeed, extractInternalNumber, parseItemSide,
+  loadCrmSnapshot, importNewItems, supaGet, supaPost, supaPatch,
+  buildCookieHeader, extractCookies, charsetFromContentType, isInterstitial, setSetting,
+  BASE_URL, UA,
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(e => {
+    console.error('\n❌ Fatal:', e.message)
+    process.exit(1)
+  })
+}
