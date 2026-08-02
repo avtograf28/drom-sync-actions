@@ -1192,6 +1192,7 @@ async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBu
   const seenNumbers       = []
   const coverCandidates   = []   // { itemId, status, photoId, savedPhotoId } — обложки тянем после DB-апдейтов
   const dromPhotoIdUpdates = []  // { id, nid } — записать последний увиденный id обложки (при смене)
+  const terminalCollisions = [] // { inventory_item_id, mismatch_type:'sold_but_listed', detail } — коллизии по номеру
 
   // Статусы, при появлении объявления переводимые в on_drom. Позиция могла быть
   // материализована при приёмке (in_stock) или ещё сырой (processing) — Дром делает
@@ -1199,11 +1200,42 @@ async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBu
   // не трогаем.
   const TO_ON_DROM = ['in_stock', 'processing']
 
+  // Терминальные позиции: карточку НЕ переписываем (см. гвард в цикле). internal_number
+  // уникален — проданная позиция держит номер, и объявление под освободившимся номером
+  // раньше подменяло её карточку (name/price/url/обложку), а она оставалась sold и в
+  // каталоге не появлялась. Живые случаи: 2221, 52280, 56556.
+  const TERMINAL_STATUS = new Set(['sold', 'written_off', 'returned'])
+  // Тип детали по первому слову (4 символа) — устойчиво к сокращениям Дрома/отчёта
+  // («Рулевая рейка» ↔ «Рул рейка», «Компрессор кондиционера» ↔ «Компрессор конд»).
+  const detailType = (s) => (s ?? '').trim().toLowerCase().split(/\s+/)[0].slice(0, 4)
+
   for (const dromItem of dromItems) {
     const crm = crmSnapshot.get(dromItem.internalNumber)
     if (!crm) continue   // new item, handled by importNewItems
 
     seenNumbers.push(dromItem.internalNumber)
+
+    // ГВАРД: терминальные позиции (sold/written_off/returned) НЕ перезаписываем. last_seen
+    // выше уже проставлен (на нём держится детектор sold_but_listed), но name/selling_price/
+    // drom_url/drom_photo_id/обложку не трогаем — иначе объявление под освободившимся номером
+    // подменяет карточку проданной, и реальный товар не появляется в каталоге. Если тип детали
+    // объявления отличается от текущего имени позиции — это чужой товар под тем же номером,
+    // флажим коллизию сразу (не ждём конца круга) с деталями для ревью.
+    if (TERMINAL_STATUS.has(crm.status)) {
+      if (dromItem.name && detailType(dromItem.name) !== detailType(crm.name)) {
+        terminalCollisions.push({
+          inventory_item_id: crm.id,
+          mismatch_type:     'sold_but_listed',
+          detail: {
+            status:    crm.status,
+            crm_name:  crm.name,
+            drom_name: dromItem.name,
+            drom_url:  dromItem.url ?? crm.drom_url ?? null,
+          },
+        })
+      }
+      continue
+    }
 
     if (dromItem.dromPrice != null && crm.selling_price !== dromItem.dromPrice) {
       priceHistoryBatch.push({
@@ -1338,6 +1370,12 @@ async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBu
     // Insert side_mismatch records via RPC: ON CONFLICT DO NOTHING on partial unique index.
     if (sideMismatches.length > 0) {
       await supaPost(supaUrl, key, 'rpc/upsert_drom_mismatches', { rows: sideMismatches })
+    }
+
+    // Коллизии по номеру у терминальных позиций (тот же RPC, ON CONFLICT (item,type) WHERE
+    // resolved=false DO NOTHING — первая, более подробная деталь сохраняется).
+    if (terminalCollisions.length > 0) {
+      await supaPost(supaUrl, key, 'rpc/upsert_drom_mismatches', { rows: terminalCollisions })
     }
 
     // Обложки — только если COVERS_ENABLED. При выключенном тумблере на Дром за картинками не
