@@ -51,7 +51,11 @@ function resolveCatalogUrl() {
 }
 
 const BASE_URL          = resolveCatalogUrl()
-const UA                = 'AvtografCRM-SyncBot/1.0 (+seller Autograf28, daily catalog sync)'
+// Браузерный UA. Бот-UA («AvtografCRM-SyncBot») Дром отдавал хвост каталога (стр. 68+) обрезанным
+// до 1–4 позиций, браузерному — полный (~50/стр.). Та же проверенная строка используется в
+// drom-pending-fetch.mjs (импортируется оттуда отсюда как BROWSER_UA — единый источник). Сопутствующие
+// заголовки warmup/ajax уже совпадают с pending-fetch.
+const UA                = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36'
 const MAX_PAGES_PER_RUN = 2        // 2 AJAX-страницы на сессию. Лимит Дрома ЖЁСТЧЕ, чем казалось:
                                   // разогрев ТОЖЕ расходует бюджет сессии, поэтому warmup + 3 стр.
                                   // (=4 запроса) стабильно ловит 403 на 3-й странице, а warmup +
@@ -64,12 +68,11 @@ const MAX_HARD_PAGE     = 150      // аварийный потолок: есл�
 const TIMER_INTERVAL_MIN = 30      // шаг таймера systemd (для оценки времени следующей попытки)
 const REQSIG_TTL_MIN     = 120     // reqsig из кэша считаем валидным < 2 ч; иначе принудительный
                                    // разогрев (намерено ≥4 ч стабильности, берём с запасом вдвое)
-// Пауза между кругами: после завершения полного круга новый прогон со страницы 1 откладывается
-// на столько часов. Ставилась под баны Дрома при работе с ПОСТОЯННОГО IP. Здесь (VPS-A —
-// резерв, постоянный адрес) пауза уместна, поэтому 12. В заготовке для GitHub Actions стоит 0
-// (раннеры приходят с чистых IP, ограничений нет). При 0 проверка ниже не срабатывает — новый
-// круг стартует сразу (быстрее находим расхождения и добираем обложки).
-const CYCLE_COOLDOWN_HOURS = 12
+// Паузы между кругами нет: новый круг стартует сразу после завершения предыдущего. Реальные
+// ограничители — MAX_PAGES_PER_RUN=2 и 15-мин интервал крона (за 139+ прогонов подряд ни одного
+// 403). Прежняя константа CYCLE_COOLDOWN_HOURS ставилась под баны с ПОСТОЯННОГО IP, но откладывала
+// свежие позиции до суток и различалась между репо (VPS-A=12 / Actions=0) — уже была затёрта при
+// копировании файла, поэтому убрана совсем.
 
 // ── Backoff при бане Дрома (состояние в app_settings, переживает рестарты) ────
 // Таймер круглосуточный (каждые 15 мин). Чтобы при 403/бане не долбиться 96 раз
@@ -483,11 +486,6 @@ async function syncCoverForItem(supaUrl, key, itemId, status, photoId, savedPhot
 
 async function getCycleStart(supaUrl, key) {
   const rows = await supaGet(supaUrl, key, 'app_settings', 'select=value&key=eq.drom_cycle_started_at')
-  return rows[0]?.value ?? null
-}
-
-async function getCycleCompleted(supaUrl, key) {
-  const rows = await supaGet(supaUrl, key, 'app_settings', 'select=value&key=eq.drom_cycle_completed_at')
   return rows[0]?.value ?? null
 }
 
@@ -1713,24 +1711,8 @@ async function main() {
     }
   }
 
-  // Pre-Phase: determine resume position and check 24h cooldown
+  // Pre-Phase: determine resume position
   const startPage = await checkLastRun(supaUrl, key)
-
-  // При CYCLE_COOLDOWN_HOURS === 0 пауза между кругами выключена — проверку не выполняем.
-  if (startPage === 1 && CYCLE_COOLDOWN_HOURS > 0) {
-    const completedAt = await getCycleCompleted(supaUrl, key)
-    if (completedAt) {
-      const hoursAgo = (Date.now() - new Date(completedAt).getTime()) / 3_600_000
-      if (hoursAgo < CYCLE_COOLDOWN_HOURS) {
-        const hoursLeft = (CYCLE_COOLDOWN_HOURS - hoursAgo).toFixed(1)
-        console.log(
-          `\n⏸  Круг завершён ${hoursAgo.toFixed(1)} ч. назад,` +
-          ` следующий начнётся через ${hoursLeft} ч. — пропускаем прогон`
-        )
-        process.exit(0)
-      }
-    }
-  }
 
   // Pre-Phase: read current cycle start
   let cycleStart = await getCycleStart(supaUrl, key)
@@ -1910,11 +1892,7 @@ async function main() {
     if (!DRY_RUN) {
       const completedNow = new Date().toISOString()
       await setCycleCompleted(supaUrl, key, completedNow)
-      console.log(
-        CYCLE_COOLDOWN_HOURS > 0
-          ? `  Круг завершён, следующий — не ранее чем через ${CYCLE_COOLDOWN_HOURS} ч. (${completedNow})`
-          : `  Круг завершён, следующий начнётся сразу — пауза между кругами выключена (${completedNow})`
-      )
+      console.log(`  Круг завершён, следующий начнётся сразу (${completedNow})`)
     }
   }
 
