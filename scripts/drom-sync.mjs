@@ -1663,18 +1663,22 @@ async function detectMismatches(supaUrl, key, cycleStart, opts = {}) {
 // с продажи (объявление удалено), товар на складе есть → in_stock. Счётчик — drom_miss_streak
 // (сброс в 0 при появлении в каталоге — см. updateExistingItems; инкремент здесь на завершении
 // круга). Предохранитель: если за круг не увидено > AUTO_MOVE_MAX_MISS_FRAC каталога — вероятен
-// сбой парсинга, НИЧЕГО не трогаем (ни инкремента, ни перевода), только лог. Дочерние
-// (parent_item_id) и накопительные (is_recurring) исключены. Каждый перевод фиксируется строкой
-// drom_mismatches типа 'auto_moved_to_stock' (видно в сверке). Гейт AUTO_MOVE_STALE_ENABLED — в main.
+// сбой парсинга, НИЧЕГО не трогаем (ни инкремента, ни перевода), только лог. Накопительные
+// (is_recurring) исключены — у них одно объявление на позицию с количеством. Дочерние (сплиты)
+// ВКЛЮЧЕНЫ: проверка показала, что у 82 из 94 дочерних on_drom своё объявление (собственный
+// drom_url ≠ родительского), поэтому исчезновение их листинга — такой же сигнал снятия. Каждый
+// перевод фиксируется строкой drom_mismatches типа 'auto_moved_to_stock' (видно в сверке). Гейт
+// AUTO_MOVE_STALE_ENABLED — в main.
 async function autoMoveStaleItems(supaUrl, key, cycleStart, itemsCount) {
   if (!cycleStart) {
     console.warn('  ⚠️  cycleStart не определён — автоперевод пропущен')
     return { moved: 0, incremented: 0, skippedGuard: false }
   }
 
-  // Кандидаты: on_drom, не дочерние, не накопительные, не виденные в этом круге (last_seen старше
-  // начала круга ИЛИ ещё null). Два запроса вместо or=() — надёжнее по разбору значения-таймстемпа.
-  const baseFilter = 'select=id,drom_miss_streak&status=eq.on_drom&parent_item_id=is.null&is_recurring=is.false'
+  // Кандидаты: on_drom, не накопительные (дочерние-сплиты включены — у них своё объявление), не
+  // виденные в этом круге (last_seen старше начала круга ИЛИ ещё null). Два запроса вместо or() —
+  // надёжнее по разбору значения-таймстемпа.
+  const baseFilter = 'select=id,drom_miss_streak&status=eq.on_drom&is_recurring=is.false'
   const staleRows = await supaGet(supaUrl, key, 'inventory_items', `${baseFilter}&last_seen_at=lt.${cycleStart}`)
   const nullRows  = await supaGet(supaUrl, key, 'inventory_items', `${baseFilter}&last_seen_at=is.null`)
   const notSeen   = [...staleRows, ...nullRows]
