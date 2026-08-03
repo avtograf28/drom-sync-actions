@@ -74,6 +74,16 @@ const REQSIG_TTL_MIN     = 120     // reqsig из кэша считаем вал
 // свежие позиции до суток и различалась между репо (VPS-A=12 / Actions=0) — уже была затёрта при
 // копировании файла, поэтому убрана совсем.
 
+// Пункт 3: автоперевод снятых с Дрома on_drom → in_stock после AUTO_MOVE_STREAK пропущенных кругов
+// подряд. ВЫКЛЮЧЕН по умолчанию: включать ТОЛЬКО когда last_seen_at починен на всех позициях,
+// иначе живые позиции без матча по номеру начнут копить пропуски по старым данным. Вкл: env
+// DROM_AUTO_MOVE_STALE=1. Сброс счётчика — при каждом появлении в каталоге (см. updateExistingItems);
+// инкремент и перевод — на завершении полного круга (см. autoMoveStaleItems).
+const AUTO_MOVE_STALE_ENABLED = process.env.DROM_AUTO_MOVE_STALE === '1'
+const AUTO_MOVE_STREAK        = 3      // сколько полных кругов подряд позиция не видна → перевод
+const AUTO_MOVE_MAX_MISS_FRAC = 0.10   // предохранитель: если за круг не увидено > 10% каталога —
+                                       // вероятен сбой парсинга, перевод не выполняем, только лог
+
 // ── Backoff при бане Дрома (состояние в app_settings, переживает рестарты) ────
 // Таймер круглосуточный (каждые 15 мин). Чтобы при 403/бане не долбиться 96 раз
 // в сутки и не продлевать бан, после отказа пропускаем N ближайших прогонов:
@@ -1181,7 +1191,7 @@ async function importNewItems(supaUrl, key, newItems, crmSnapshot) {
 
 // ── Phase 5: Update existing items ────────────────────────────────────────────
 
-async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBudget) {
+async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBudget, crmByUrl) {
   const priceHistoryBatch = []
   const priceUpdates      = []
   const nameUpdates       = []
@@ -1189,7 +1199,9 @@ async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBu
   const sideMismatches    = []
   const statusUpdates     = []
   const dromUrlUpdates    = []
-  const seenNumbers       = []
+  const seenIds           = []   // id всех сматченных позиций (по номеру ИЛИ url) — пункт 1: last_seen
+                                 // ставим по id, поэтому попадают и позиции, чей номер в фиде не сошёлся
+  const reseenActiveIds   = []   // id снова увиденных on_drom/reserved — пункт 2: сразу снять missing_from_drom
   const coverCandidates   = []   // { itemId, status, photoId, savedPhotoId } — обложки тянем после DB-апдейтов
   const dromPhotoIdUpdates = []  // { id, nid } — записать последний увиденный id обложки (при смене)
   const terminalCollisions = [] // { inventory_item_id, mismatch_type:'sold_but_listed', detail } — коллизии по номеру
@@ -1210,10 +1222,15 @@ async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBu
   const detailType = (s) => (s ?? '').trim().toLowerCase().split(/\s+/)[0].slice(0, 4)
 
   for (const dromItem of dromItems) {
-    const crm = crmSnapshot.get(dromItem.internalNumber)
+    // Пункт 1: сначала матч по номеру; если номер в фиде не совпал (напр. «59431П», слэш-варианты)
+    // — fallback по drom_url. Та же позиция, отметку «виден» ставим ей, дубль не создаём
+    // (onPageComplete исключает url-совпадения из newPageItems).
+    let crm = crmSnapshot.get(dromItem.internalNumber)
+    if (!crm && dromItem.url) crm = crmByUrl.get(dromItem.url)
     if (!crm) continue   // new item, handled by importNewItems
 
-    seenNumbers.push(dromItem.internalNumber)
+    seenIds.push(crm.id)
+    if (crm.status === 'on_drom' || crm.status === 'reserved') reseenActiveIds.push(crm.id)
 
     // ГВАРД: терминальные позиции (sold/written_off/returned) НЕ перезаписываем. last_seen
     // выше уже проставлен (на нём держится детектор sold_but_listed), но name/selling_price/
@@ -1317,19 +1334,37 @@ async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBu
   let coversUpdated    = 0
   let coversSkippedOwn = 0
   let coverErrors      = 0
+  let missingReClosed  = 0           // пункт 2: сколько missing_from_drom снято поблочно
   const coverDeferred  = new Set()   // id позиций, чья обложка отложена (лимит/ошибка) — id не двигаем
 
   if (!DRY_RUN) {
     const now   = new Date().toISOString()
     const BATCH = 500
 
-    // Batch update last_seen_at for all items seen in this block
-    for (let i = 0; i < seenNumbers.length; i += BATCH) {
-      const batch  = seenNumbers.slice(i, i + BATCH)
-      const inList = batch.join(',')
-      await supaPatch(supaUrl, key, 'inventory_items', `internal_number=in.(${inList})`, {
-        last_seen_at: now,
+    // Пункт 1/3: last_seen_at + сброс drom_miss_streak по id всех увиденных в блоке позиций
+    // (по id, а не по номеру — так отметку получают и сматченные по url при несовпадении номера).
+    for (let i = 0; i < seenIds.length; i += BATCH) {
+      const inList = seenIds.slice(i, i + BATCH).join(',')
+      await supaPatch(supaUrl, key, 'inventory_items', `id=in.(${inList})`, {
+        last_seen_at: now, drom_miss_streak: 0,
       })
+    }
+
+    // Пункт 2: снять missing_from_drom СРАЗУ, как позиция снова появилась в каталоге, а не ждать
+    // завершения круга. Иначе объявление, «поднятое» продавцом на 1-ю страницу уже после того,
+    // как медленный 10-часовой обход прошёл первые страницы, кролер застаёт лишь на следующем
+    // круге, и флаг ложно висит. Completion-sweep в detectMismatches остаётся как подстраховка.
+    for (let i = 0; i < reseenActiveIds.length; i += BATCH) {
+      const inList = reseenActiveIds.slice(i, i + BATCH).join(',')
+      const open = await supaGet(
+        supaUrl, key, 'drom_mismatches',
+        `select=id&mismatch_type=eq.missing_from_drom&resolved=eq.false&inventory_item_id=in.(${inList})`
+      )
+      if (open.length > 0) {
+        const ids = open.map(r => r.id).join(',')
+        await supaPatch(supaUrl, key, 'drom_mismatches', `id=in.(${ids})`, { resolved: true, resolved_at: now })
+        missingReClosed += open.length
+      }
     }
 
     // Insert price_history records
@@ -1449,13 +1484,14 @@ async function updateExistingItems(supaUrl, key, dromItems, crmSnapshot, coverBu
   }
 
   return {
-    seenCount:      seenNumbers.length,
+    seenCount:      seenIds.length,
     priceUpdates:   priceUpdates.length,
     nameUpdates:    nameUpdates.length,
     sideUpdates:    sideUpdates.length,
     statusUpdates:  statusUpdates.length,
     dromUrlUpdates: dromUrlUpdates.length,
     sideMismatches: sideMismatches.length,
+    missingReClosed,
     coversLoaded,
     coversUpdated,
     coversSkippedOwn,
@@ -1622,6 +1658,80 @@ async function detectMismatches(supaUrl, key, cycleStart, opts = {}) {
   }
 }
 
+// ── Пункт 3: автоперевод снятых с Дрома on_drom → in_stock ─────────────────────
+// Позиция on_drom, не встреченная синком AUTO_MOVE_STREAK полных кругов подряд, считается снятой
+// с продажи (объявление удалено), товар на складе есть → in_stock. Счётчик — drom_miss_streak
+// (сброс в 0 при появлении в каталоге — см. updateExistingItems; инкремент здесь на завершении
+// круга). Предохранитель: если за круг не увидено > AUTO_MOVE_MAX_MISS_FRAC каталога — вероятен
+// сбой парсинга, НИЧЕГО не трогаем (ни инкремента, ни перевода), только лог. Дочерние
+// (parent_item_id) и накопительные (is_recurring) исключены. Каждый перевод фиксируется строкой
+// drom_mismatches типа 'auto_moved_to_stock' (видно в сверке). Гейт AUTO_MOVE_STALE_ENABLED — в main.
+async function autoMoveStaleItems(supaUrl, key, cycleStart, itemsCount) {
+  if (!cycleStart) {
+    console.warn('  ⚠️  cycleStart не определён — автоперевод пропущен')
+    return { moved: 0, incremented: 0, skippedGuard: false }
+  }
+
+  // Кандидаты: on_drom, не дочерние, не накопительные, не виденные в этом круге (last_seen старше
+  // начала круга ИЛИ ещё null). Два запроса вместо or=() — надёжнее по разбору значения-таймстемпа.
+  const baseFilter = 'select=id,drom_miss_streak&status=eq.on_drom&parent_item_id=is.null&is_recurring=is.false'
+  const staleRows = await supaGet(supaUrl, key, 'inventory_items', `${baseFilter}&last_seen_at=lt.${cycleStart}`)
+  const nullRows  = await supaGet(supaUrl, key, 'inventory_items', `${baseFilter}&last_seen_at=is.null`)
+  const notSeen   = [...staleRows, ...nullRows]
+
+  // Предохранитель по доле пропущенного от заявленного размера каталога.
+  const missFrac = itemsCount ? notSeen.length / itemsCount : 0
+  if (itemsCount && missFrac > AUTO_MOVE_MAX_MISS_FRAC) {
+    console.warn(
+      `  ⚠️  Не увидено ${(missFrac * 100).toFixed(1)}% каталога (${notSeen.length}/${itemsCount}) — ` +
+      'вероятен сбой парсинга. Инкремент и автоперевод пропущены.'
+    )
+    return { moved: 0, incremented: 0, skippedGuard: true }
+  }
+
+  const now   = new Date().toISOString()
+  const BATCH = 500
+
+  // Инкремент streak невиденным. PostgREST не умеет x = x + 1 → группируем по текущему значению.
+  const byStreak = new Map()   // curStreak -> [ids]
+  for (const r of notSeen) {
+    const s = r.drom_miss_streak ?? 0
+    if (!byStreak.has(s)) byStreak.set(s, [])
+    byStreak.get(s).push(r.id)
+  }
+  const toMove = []
+  for (const [s, ids] of byStreak) {
+    const next = s + 1
+    for (let i = 0; i < ids.length; i += BATCH) {
+      const inList = ids.slice(i, i + BATCH).join(',')
+      await supaPatch(supaUrl, key, 'inventory_items', `id=in.(${inList})`, { drom_miss_streak: next })
+    }
+    if (next >= AUTO_MOVE_STREAK) toMove.push(...ids)
+  }
+
+  // Достигшие порога: on_drom → in_stock + строка расхождения + закрыть их missing_from_drom.
+  if (toMove.length > 0) {
+    for (let i = 0; i < toMove.length; i += BATCH) {
+      const slice  = toMove.slice(i, i + BATCH)
+      const inList = slice.join(',')
+      await supaPatch(supaUrl, key, 'inventory_items', `id=in.(${inList})`, { status: 'in_stock' })
+      const rows = slice.map(id => ({
+        inventory_item_id: id,
+        mismatch_type:     'auto_moved_to_stock',
+        detail:            { moved_at: now, reason: `не виден ${AUTO_MOVE_STREAK} круга подряд` },
+      }))
+      await supaPost(supaUrl, key, 'rpc/upsert_drom_mismatches', { rows })
+      await supaPatch(
+        supaUrl, key, 'drom_mismatches',
+        `mismatch_type=eq.missing_from_drom&resolved=eq.false&inventory_item_id=in.(${inList})`,
+        { resolved: true, resolved_at: now }
+      )
+    }
+  }
+
+  return { moved: toMove.length, incremented: notSeen.length, skippedGuard: false }
+}
+
 // ── Phase 8: Write run log ────────────────────────────────────────────────────
 
 async function writeRunLog(supaUrl, key, stats) {
@@ -1761,6 +1871,14 @@ async function main() {
   const crmSnapshot = await loadCrmSnapshot(supaUrl, key)
   vlog(`  В CRM: ${crmSnapshot.size} позиций`)
 
+  // Пункт 1: индекс по drom_url для fallback-матчинга. Позиция, чей номер в фиде не совпал, но
+  // URL объявления совпадает — та же позиция: и «виден» отметим ей, и из «новых» исключим (дубль
+  // не создаём). Строится один раз из снапшота (снапшот в течение круга не меняется).
+  const crmByUrl = new Map()
+  for (const it of crmSnapshot.values()) {
+    if (it.drom_url) crmByUrl.set(it.drom_url, it)
+  }
+
   // Stats accumulated across all pages in this block
   let totalNewImported     = 0
   let totalPendingResolved = 0
@@ -1768,6 +1886,7 @@ async function main() {
   let totalNameUpdates     = 0
   let totalSideUpdates     = 0
   let totalSideMismatches  = 0
+  let totalMissingReClosed = 0
   let totalSeenCount       = 0
   let totalCoversLoaded     = 0
   let totalCoversUpdated    = 0
@@ -1782,7 +1901,10 @@ async function main() {
   // Called after each page is fetched and deduplicated.
   // Errors propagate up and abort the block — cursor stays at last successfully committed page.
   const onPageComplete = async (pg, pageItems, _pageUnrecognized) => {
-    const newPageItems = pageItems.filter(item => !crmSnapshot.has(item.internalNumber))
+    // «Новое» = нет ни по номеру, ни по url (пункт 1: url-совпадение — существующая позиция,
+    // её обновит updateExistingItems, дубль importNewItems не создаёт).
+    const newPageItems = pageItems.filter(item =>
+      !crmSnapshot.has(item.internalNumber) && !(item.url && crmByUrl.has(item.url)))
 
     if (newPageItems.length > 0) {
       if (!DRY_RUN) {
@@ -1805,12 +1927,13 @@ async function main() {
       }
     }
 
-    const upd = await updateExistingItems(supaUrl, key, pageItems, crmSnapshot, coverBudget)
+    const upd = await updateExistingItems(supaUrl, key, pageItems, crmSnapshot, coverBudget, crmByUrl)
     totalSeenCount      += upd.seenCount
     totalPriceUpdates   += upd.priceUpdates
     totalNameUpdates    += upd.nameUpdates
     totalSideUpdates    += upd.sideUpdates
     totalSideMismatches += upd.sideMismatches
+    totalMissingReClosed += upd.missingReClosed ?? 0
     totalCoversLoaded     += upd.coversLoaded
     totalCoversUpdated    += upd.coversUpdated
     totalCoversSkippedOwn += upd.coversSkippedOwn
@@ -1820,7 +1943,7 @@ async function main() {
       await setLastPageReached(supaUrl, key, pg)
       console.log(
         `  ✓ Стр.${pg}: нов=${newPageItems.length}, обновл=${upd.seenCount},` +
-        ` цен=${upd.priceUpdates} → ckp pg=${pg}`
+        ` цен=${upd.priceUpdates}, missing снято=${upd.missingReClosed ?? 0} → ckp pg=${pg}`
       )
     }
   }
@@ -1932,6 +2055,19 @@ async function main() {
       await setCycleCompleted(supaUrl, key, completedNow)
       console.log(`  Круг завершён, следующий начнётся сразу (${completedNow})`)
     }
+
+    // Пункт 3: автоперевод снятых с Дрома (по умолчанию ВЫКЛ — DROM_AUTO_MOVE_STALE=1 включает).
+    if (!DRY_RUN && AUTO_MOVE_STALE_ENABLED) {
+      console.log('\n📦 Автоперевод снятых с Дрома (on_drom → in_stock)...')
+      const mv = await autoMoveStaleItems(supaUrl, key, cycleStart, itemsCount)
+      if (mv.skippedGuard) {
+        console.log('  Пропущено предохранителем (>10% каталога не увидено)')
+      } else {
+        console.log(`  Инкремент пропусков: ${mv.incremented}, переведено в in_stock: ${mv.moved}`)
+      }
+    } else if (!AUTO_MOVE_STALE_ENABLED) {
+      console.log('  Автоперевод снятых ВЫКЛ (DROM_AUTO_MOVE_STALE≠1) — обновлены только last_seen/счётчики')
+    }
   }
 
   // Phase 8: write run log
@@ -1967,6 +2103,7 @@ async function main() {
   console.log(`   Расхождений (продано): ${stats.mismatchesSold}`)
   console.log(`   Сторон дописано      : ${DRY_RUN ? 0 : totalSideUpdates}`)
   console.log(`   Расхождений (сторона): ${DRY_RUN ? 0 : totalSideMismatches}`)
+  console.log(`   Missing снято поблочно: ${DRY_RUN ? 0 : totalMissingReClosed}`)
   console.log(`   Коллизий номеров     : ${blockCollisions.length}`)
   if (COVERS_ENABLED) {
     console.log(`   Обложки загр/обновл/своифото/ошибок : ${DRY_RUN ? 0 : totalCoversLoaded} / ${DRY_RUN ? 0 : totalCoversUpdated} / ${DRY_RUN ? 0 : totalCoversSkippedOwn} / ${DRY_RUN ? 0 : totalCoverErrors}`)
