@@ -742,7 +742,7 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
       console.warn('  ⚠️  403 на разогреве — Дром не пустил вообще, включаю backoff')
       return {
         allItems: [], allUnrecognized: [], pagesScanned: 0, completedFull: false,
-        lastPageReached: null, startPage, blockCollisions: [], warmupBanned: true, itemsCount: null,
+        lastPageReached: null, startPage, warmupBanned: true, itemsCount: null,
         completedAtPage: null,
       }
     }
@@ -751,8 +751,7 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
   await sleep(2000 + Math.random() * 2000)
 
   const allItems         = []
-  const seenNumbers      = new Map()   // internalNumber → first item seen this block
-  const blockCollisions  = []
+  const seenNumbers      = new Map()   // internalNumber → first item seen this block (дедуп для импорта)
   const seenUnrecognized = new Set()
   const allUnrecognized  = []
   let   pagesScanned     = 0
@@ -829,7 +828,7 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
       // backoff взводится в main. Дальше блок не продолжаем.
       return {
         allItems, allUnrecognized, pagesScanned, completedFull: false,
-        lastPageReached, startPage, blockCollisions, warmupBanned: true, itemsCount,
+        lastPageReached, startPage, warmupBanned: true, itemsCount,
         completedAtPage: null,
       }
     }
@@ -869,6 +868,11 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
       break
     }
 
+    // Копим ВСЕ объявления страницы в drom_cycle_listings (по url). Детект дублей номеров теперь
+    // сводится в конце круга по всему каталогу (detectCollisionsFromCycle), а не внутри одного
+    // 2-страничного прогона — поэтому дубли на РАЗНЫХ страницах (напр. 58114) наконец ловятся.
+    if (!DRY_RUN) await recordCycleListings(supaUrl, key, items, pg)
+
     let newCount = 0
     const pageItems = []
     for (const item of items) {
@@ -877,28 +881,8 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
         allItems.push(item)
         pageItems.push(item)
         newCount++
-      } else if (seenNumbers.get(item.internalNumber).name !== item.name) {
-        const first = seenNumbers.get(item.internalNumber)
-        const sideA = parseItemSide(first.name)
-        const sideB = parseItemSide(item.name)
-        vlog(
-          `\n⚠️  КОЛЛИЗИЯ НОМЕРА: №${item.internalNumber}` +
-          `\n   A: "${first.name}" (сторона: ${sideA ?? 'не распознана'})` +
-          `\n      https://baza.drom.ru${first.url || ''}` +
-          `\n   B: "${item.name}" (сторона: ${sideB ?? 'не распознана'})` +
-          `\n      https://baza.drom.ru${item.url || ''}`
-        )
-        blockCollisions.push({
-          internal_number: item.internalNumber,
-          url_a:  first.url ?? '',
-          name_a: first.name,
-          side_a: sideA,
-          url_b:  item.url ?? '',
-          name_b: item.name,
-          side_b: sideB,
-        })
       }
-      // else: одинаковое имя → артефакт пагинации, тихий drop
+      // Дубль номера (то же ИЛИ другое имя) — тихий drop здесь; коллизии сводятся в конце круга.
     }
     const pageUnrecognized = []
     for (const u of unrecognized) {
@@ -968,7 +952,7 @@ async function fetchAllDromListings(supaUrl, key, startPage, onPageComplete = nu
   console.log(`\n📋 Статус: ${status}`)
   // warmupBanned=false: разогрев прошёл. Даже если внутри блока был 403/заглушка
   // (лимит частоты) — это НЕ бан, backoff не включаем, чекпоинт сохранён.
-  return { allItems, allUnrecognized, pagesScanned, completedFull, lastPageReached, startPage, blockCollisions, warmupBanned: false, itemsCount, completedAtPage }
+  return { allItems, allUnrecognized, pagesScanned, completedFull, lastPageReached, startPage, warmupBanned: false, itemsCount, completedAtPage }
 }
 
 // ── Phase 2: Load CRM snapshot ────────────────────────────────────────────────
@@ -1794,39 +1778,120 @@ async function writeUnrecognized(supaUrl, key, items) {
   }
 }
 
-// ── Write number collisions to DB ────────────────────────────────────────────
+// ── Number collisions across the WHOLE cycle (не внутри одного 2-страничного прогона) ──────
 
-async function writeCollisions(supaUrl, key, collisions) {
-  const now  = new Date().toISOString()
-  const rows = collisions.map(col => ({
-    internal_number: col.internal_number,
-    url_a:           col.url_a,
-    name_a:          col.name_a,
-    side_a:          col.side_a,
-    url_b:           col.url_b,
-    name_b:          col.name_b,
-    side_b:          col.side_b,
-    last_seen_at:    now,
-  }))
+// Копит объявления круга в drom_cycle_listings (upsert по url). Сдвиг пагинации даёт тот же url →
+// схлопывается; настоящий дубль номера — разные url → сосуществуют. Только объявления с url.
+async function recordCycleListings(supaUrl, key, items, pg) {
+  // Дедуп по url внутри страницы (страховка: PostgREST upsert падает, если один url в батче дважды).
+  const byUrl = new Map()
+  for (const it of items) {
+    if (!it.url) continue
+    byUrl.set(it.url, {
+      internal_number: it.internalNumber,
+      title:           it.name ?? null,
+      url:             it.url,
+      price:           it.dromPrice ?? null,
+      page:            pg,
+    })
+  }
+  const rows = [...byUrl.values()]
+  if (rows.length === 0) return
+  const BATCH = 500
+  for (let i = 0; i < rows.length; i += BATCH) {
+    await supaPost(
+      supaUrl, key,
+      'drom_cycle_listings?on_conflict=url',
+      rows.slice(i, i + BATCH),
+      'resolution=merge-duplicates,return=minimal'
+    )
+  }
+}
 
-  // INSERT via RPC: ON CONFLICT (internal_number) WHERE (resolved = false) DO NOTHING
-  await supaPost(supaUrl, key, 'rpc/upsert_drom_number_collisions', { rows })
+// Очистка накопителя в начале круга. PostgREST требует фильтр на DELETE → id > 0 (все строки).
+async function clearCycleListings(supaUrl, key) {
+  await supaDelete(supaUrl, key, 'drom_cycle_listings', 'id=gt.0')
+}
 
-  // Обновить last_seen_at на нерезолюченных записях (новых и уже существующих)
-  for (const col of collisions) {
-    try {
-      await supaPatch(
-        supaUrl, key,
-        'drom_number_collisions',
-        `internal_number=eq.${encodeURIComponent(col.internal_number)}&resolved=eq.false`,
-        { last_seen_at: now }
-      )
-    } catch (e) {
-      vwarn(`  ⚠️  Не удалось обновить last_seen_at для коллизии №${col.internal_number}: ${e.message}`)
-    }
+// В конце круга сводит дубли: номер под >1 РАЗНЫМИ url — коллизия. Фиксирует оба url/заголовка/цены,
+// какое сейчас в CRM (по inventory_items.drom_url из snapshot) и есть ли ждущая закупка (pending +
+// партия). Сравнение по url, а не по заголовку — отсекает одно объявление, попавшее дважды из-за
+// сдвига пагинации.
+async function detectCollisionsFromCycle(supaUrl, key, crmSnapshot) {
+  // 1. Выгрузить накопитель постранично.
+  const PAGE = 1000
+  const all = []
+  for (let offset = 0; ; offset += PAGE) {
+    const rows = await supaGet(supaUrl, key, 'drom_cycle_listings',
+      `select=internal_number,title,url,price,page&limit=${PAGE}&offset=${offset}`)
+    all.push(...rows)
+    if (rows.length < PAGE) break
   }
 
-  console.log(`  ⚠️  Коллизий номеров зафиксировано в БД: ${collisions.length}`)
+  // 2. Группировка по номеру; дубль = >1 РАЗНЫХ url.
+  const byNum = new Map()
+  for (const r of all) {
+    if (!byNum.has(r.internal_number)) byNum.set(r.internal_number, new Map())
+    byNum.get(r.internal_number).set(r.url, r)   // Map по url — одинаковые url схлопываются
+  }
+  const collisions = []
+  for (const [num, byUrl] of byNum) {
+    if (byUrl.size < 2) continue
+    const listings = [...byUrl.values()].sort((a, b) => (a.page ?? 0) - (b.page ?? 0))
+    const a = listings[0], b = listings[1]
+    const crmUrl = crmSnapshot.get(num)?.drom_url ?? null
+    const in_crm = crmUrl && crmUrl === a.url ? 'a' : crmUrl && crmUrl === b.url ? 'b' : 'none'
+    collisions.push({ num, a, b, in_crm, extra: byUrl.size - 2 })
+  }
+  if (collisions.length === 0) {
+    console.log('  Коллизий номеров (весь каталог): 0')
+    return { count: 0 }
+  }
+
+  // 3. Ждущие закупки для этих номеров (+ партия) — для пометки потерянного объявления.
+  const nums = collisions.map(c => c.num)
+  const CH = 100
+  const pendingByNum = new Map()
+  for (let i = 0; i < nums.length; i += CH) {
+    const inList = nums.slice(i, i + CH).map(n => encodeURIComponent(n)).join(',')
+    const rows = await supaGet(supaUrl, key, 'pending_purchases',
+      `select=internal_number,name,shipment_id&resolved_at=is.null&internal_number=in.(${inList})`)
+    for (const p of rows) if (!pendingByNum.has(p.internal_number)) pendingByNum.set(p.internal_number, p)
+  }
+  const shipIds = [...new Set([...pendingByNum.values()].map(p => p.shipment_id).filter(Boolean))]
+  const batchById = new Map()
+  for (let i = 0; i < shipIds.length; i += CH) {
+    const rows = await supaGet(supaUrl, key, 'shipments',
+      `select=id,batch_number&id=in.(${shipIds.slice(i, i + CH).join(',')})`)
+    for (const s of rows) batchById.set(s.id, s.batch_number)
+  }
+
+  // 4. Запись в drom_number_collisions (RPC, ON CONFLICT (internal_number) WHERE unresolved DO NOTHING).
+  const now = new Date().toISOString()
+  const rpcRows = collisions.map(c => {
+    const pend = pendingByNum.get(c.num)
+    let pending_note = null
+    if (pend) {
+      const batch = pend.shipment_id ? batchById.get(pend.shipment_id) : null
+      pending_note = `Ждёт закупка «${pend.name ?? '?'}»` + (batch ? ` (партия ${batch})` : '')
+    }
+    return {
+      internal_number: c.num,
+      url_a: c.a.url, name_a: c.a.title, side_a: parseItemSide(c.a.title ?? ''),
+      url_b: c.b.url, name_b: c.b.title, side_b: parseItemSide(c.b.title ?? ''),
+      price_a: c.a.price ?? null, price_b: c.b.price ?? null,
+      in_crm: c.in_crm,
+      pending_note,
+      last_seen_at: now,
+    }
+  })
+  await supaPost(supaUrl, key, 'rpc/upsert_drom_number_collisions', { rows: rpcRows })
+  const extraCount = collisions.filter(c => c.extra > 0).length
+  console.log(
+    `  ⚠️  Коллизий номеров (весь каталог): ${rpcRows.length}` +
+    (extraCount ? ` (у ${extraCount} более 2 объявлений — в записи первые два)` : '')
+  )
+  return { count: rpcRows.length }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -1865,6 +1930,13 @@ async function main() {
 
   // Pre-Phase: determine resume position
   const startPage = await checkLastRun(supaUrl, key)
+
+  // Начало нового круга (startPage===1) → чистим накопитель объявлений ДО обхода, чтобы коллизии
+  // сводились по объявлениям ТЕКУЩЕГО круга, а не мешались с прошлым (детект — в конце круга).
+  if (startPage === 1 && !DRY_RUN) {
+    await clearCycleListings(supaUrl, key)
+    console.log('  Накопитель объявлений круга очищен (новый круг)')
+  }
 
   // Pre-Phase: read current cycle start
   let cycleStart = await getCycleStart(supaUrl, key)
@@ -1954,7 +2026,7 @@ async function main() {
 
   // Phase 1: scan block (resume from last_page_reached + 1), process each page immediately
   console.log('\n📡 Обход каталога ...')
-  const { allItems, allUnrecognized, pagesScanned, completedFull, lastPageReached, blockCollisions, warmupBanned, itemsCount, completedAtPage } =
+  const { allItems, allUnrecognized, pagesScanned, completedFull, lastPageReached, warmupBanned, itemsCount, completedAtPage } =
     await fetchAllDromListings(supaUrl, key, startPage, onPageComplete)
 
   // Backoff ТОЛЬКО при бане на разогреве (Дром не пустил вообще). 403 посреди
@@ -1986,16 +2058,8 @@ async function main() {
     console.log('  ✓ backoff сброшен (разогрев прошёл — успешный контакт с Дромом)')
   }
 
-  // Write number collisions detected within this block
-  if (blockCollisions.length > 0 && !DRY_RUN) {
-    console.log('\n⚠️  Запись коллизий номеров...')
-    await writeCollisions(supaUrl, key, blockCollisions)
-  } else if (blockCollisions.length > 0 && DRY_RUN) {
-    console.log('\n(DRY RUN) Коллизии номеров (запись пропущена):')
-    for (const col of blockCollisions) {
-      vlog(`  №${col.internal_number}: "${col.name_a}" vs "${col.name_b}"`)
-    }
-  }
+  // Коллизии номеров теперь сводятся по всему каталогу в конце круга (см. блок completedFull ниже),
+  // а не поблочно — старый поблочный детектор убран (ловил только дубли внутри одного 2-стр. прогона).
 
   // If this is the first block of a new cycle, record the cycle start time
   if (startPage === 1) {
@@ -2047,12 +2111,20 @@ async function main() {
   // Phase 7: detect mismatches — only when full cycle completed
   let mismatchesMissing = 0
   let mismatchesSold    = 0
+  let cycleCollisions   = 0
   if (completedFull) {
     console.log('\n🔍 Поиск расхождений...')
     const result = await detectMismatches(supaUrl, key, cycleStart, { completedAtPage, itemsCount })
     mismatchesMissing = result.missingFromDrom
     mismatchesSold    = result.soldButListed
     console.log(`  Пропали с Дрома: ${mismatchesMissing}, продано но висит: ${mismatchesSold}, автозакрыто: ${result.autoClosed}`)
+
+    // Дубли номеров на всём каталоге — сводим накопитель круга (см. detectCollisionsFromCycle).
+    if (!DRY_RUN) {
+      console.log('\n⚠️  Сведение дублей номеров (весь каталог)...')
+      const col = await detectCollisionsFromCycle(supaUrl, key, crmSnapshot)
+      cycleCollisions = col.count
+    }
 
     if (!DRY_RUN) {
       const completedNow = new Date().toISOString()
@@ -2108,7 +2180,7 @@ async function main() {
   console.log(`   Сторон дописано      : ${DRY_RUN ? 0 : totalSideUpdates}`)
   console.log(`   Расхождений (сторона): ${DRY_RUN ? 0 : totalSideMismatches}`)
   console.log(`   Missing снято поблочно: ${DRY_RUN ? 0 : totalMissingReClosed}`)
-  console.log(`   Коллизий номеров     : ${blockCollisions.length}`)
+  console.log(`   Коллизий номеров     : ${DRY_RUN ? 0 : cycleCollisions}`)
   if (COVERS_ENABLED) {
     console.log(`   Обложки загр/обновл/своифото/ошибок : ${DRY_RUN ? 0 : totalCoversLoaded} / ${DRY_RUN ? 0 : totalCoversUpdated} / ${DRY_RUN ? 0 : totalCoversSkippedOwn} / ${DRY_RUN ? 0 : totalCoverErrors}`)
   } else {
