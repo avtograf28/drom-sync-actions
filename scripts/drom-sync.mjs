@@ -1551,23 +1551,52 @@ async function detectMismatches(supaUrl, key, cycleStart, opts = {}) {
     return { missingFromDrom: 0, soldButListed: 0, autoClosed: 0, skippedGuard: true }
   }
 
+  // missing_from_drom: порог 2 круга (drom_miss_streak >= 2). Объявление, поднятое на 1-ю страницу
+  // после того, как обход прошёл начало, за один круг не встречается и самоизлечивается на следующем
+  // — поэтому флаг ставим только со ВТОРОГО пропущенного круга. Счётчик инкрементит bumpMissStreak
+  // ДО этой детекции (см. порядок в main), так что здесь streak уже учитывает текущий пропуск.
   const missingRows = await supaGet(
     supaUrl, key,
     'inventory_items',
-    `select=id,status,last_seen_at` +
+    `select=id,status,last_seen_at,drom_miss_streak` +
     `&status=in.(on_drom,reserved)` +
     `&last_seen_at=not.is.null` +
-    `&last_seen_at=lt.${cycleStart}`
+    `&last_seen_at=lt.${cycleStart}` +
+    `&drom_miss_streak=gte.2`
   )
 
-  const soldRows = await supaGet(
+  // sold_but_listed: кандидаты — терминальные позиции, встреченные в этом круге. Но флаг ставим
+  // ТОЛЬКО если встреча ПОЗЖЕ продажи: круг идёт ~10 ч, увиденное ночью могли продать днём — в
+  // момент встречи расхождения не было (ложные срабатывания в разгар продаж). Для sold сравниваем
+  // с точным sales.created_at (последняя продажа), для returned/written_off — фолбэк на sold_at по дню.
+  const soldCandidates = await supaGet(
     supaUrl, key,
     'inventory_items',
-    `select=id,status,last_seen_at` +
+    `select=id,status,last_seen_at,sold_at` +
     `&status=in.(sold,returned,written_off)` +
     `&last_seen_at=not.is.null` +
     `&last_seen_at=gte.${cycleStart}`
   )
+  const soldIds = soldCandidates.filter(r => r.status === 'sold').map(r => r.id)
+  const saleTimeById = new Map()   // inventory_item_id → последняя sales.created_at
+  const CH = 100
+  for (let i = 0; i < soldIds.length; i += CH) {
+    const rows = await supaGet(supaUrl, key, 'sales',
+      `select=inventory_item_id,created_at&inventory_item_id=in.(${soldIds.slice(i, i + CH).join(',')})`)
+    for (const s of rows) {
+      const prev = saleTimeById.get(s.inventory_item_id)
+      if (!prev || new Date(s.created_at) > new Date(prev)) saleTimeById.set(s.inventory_item_id, s.created_at)
+    }
+  }
+  const soldRows = soldCandidates.filter(r => {
+    if (r.status === 'sold') {
+      const saleTime = saleTimeById.get(r.id)
+      if (saleTime) return new Date(r.last_seen_at) > new Date(saleTime)   // встречен ПОСЛЕ продажи
+      return r.sold_at != null && r.last_seen_at.slice(0, 10) > r.sold_at  // нет записи продажи → по дню
+    }
+    // returned / written_off — точного ts нет, фолбэк на sold_at по дню
+    return r.sold_at != null && r.last_seen_at.slice(0, 10) > r.sold_at
+  })
 
   const missingFromDrom = missingRows.map(r => ({
     inventory_item_id: r.id,
@@ -1642,82 +1671,83 @@ async function detectMismatches(supaUrl, key, cycleStart, opts = {}) {
   }
 }
 
-// ── Пункт 3: автоперевод снятых с Дрома on_drom → in_stock ─────────────────────
-// Позиция on_drom, не встреченная синком AUTO_MOVE_STREAK полных кругов подряд, считается снятой
-// с продажи (объявление удалено), товар на складе есть → in_stock. Счётчик — drom_miss_streak
-// (сброс в 0 при появлении в каталоге — см. updateExistingItems; инкремент здесь на завершении
-// круга). Предохранитель: если за круг не увидено > AUTO_MOVE_MAX_MISS_FRAC каталога — вероятен
-// сбой парсинга, НИЧЕГО не трогаем (ни инкремента, ни перевода), только лог. Накопительные
-// (is_recurring) исключены — у них одно объявление на позицию с количеством. Дочерние (сплиты)
-// ВКЛЮЧЕНЫ: проверка показала, что у 82 из 94 дочерних on_drom своё объявление (собственный
-// drom_url ≠ родительского), поэтому исчезновение их листинга — такой же сигнал снятия. Каждый
-// перевод фиксируется строкой drom_mismatches типа 'auto_moved_to_stock' (видно в сверке). Гейт
-// AUTO_MOVE_STALE_ENABLED — в main.
-async function autoMoveStaleItems(supaUrl, key, cycleStart, itemsCount) {
+// ── Конец круга 1/2: инкремент счётчика пропусков (ВСЕГДА, до детекции) ────────
+// drom_miss_streak — сколько полных кругов подряд позиция не встречена. Сброс в 0 при появлении
+// (updateExistingItems, поблочно). Инкремент — ЗДЕСЬ, на завершении круга, НЕЗАВИСИМО от флага
+// автоперевода: на счётчике держатся И порог missing_from_drom (>=2), И порог автоперевода (>=3).
+// Раньше инкремент жил внутри автоперевода (скрытая связка: выключат его — счётчик замирает и
+// missing перестаёт ставиться). Предохранитель: если за круг не увидено > AUTO_MOVE_MAX_MISS_FRAC
+// каталога — вероятен сбой парсинга, инкремент НЕ выполняем (и автоперевод в main пропускаем).
+// Накопительные (is_recurring) исключены. reserved включён (нужен для missing-детекции).
+async function bumpMissStreak(supaUrl, key, cycleStart, itemsCount) {
   if (!cycleStart) {
-    console.warn('  ⚠️  cycleStart не определён — автоперевод пропущен')
-    return { moved: 0, incremented: 0, skippedGuard: false }
+    console.warn('  ⚠️  cycleStart не определён — инкремент streak пропущен')
+    return { incremented: 0, skippedGuard: false }
   }
-
-  // Кандидаты: on_drom, не накопительные (дочерние-сплиты включены — у них своё объявление), не
-  // виденные в этом круге (last_seen старше начала круга ИЛИ ещё null). Два запроса вместо or() —
-  // надёжнее по разбору значения-таймстемпа.
-  const baseFilter = 'select=id,drom_miss_streak&status=eq.on_drom&is_recurring=is.false'
+  const baseFilter = 'select=id,drom_miss_streak&status=in.(on_drom,reserved)&is_recurring=is.false'
   const staleRows = await supaGet(supaUrl, key, 'inventory_items', `${baseFilter}&last_seen_at=lt.${cycleStart}`)
   const nullRows  = await supaGet(supaUrl, key, 'inventory_items', `${baseFilter}&last_seen_at=is.null`)
   const notSeen   = [...staleRows, ...nullRows]
 
-  // Предохранитель по доле пропущенного от заявленного размера каталога.
+  // Предохранитель по доле пропущенного от заявленного размера каталога — защищает инкремент.
   const missFrac = itemsCount ? notSeen.length / itemsCount : 0
   if (itemsCount && missFrac > AUTO_MOVE_MAX_MISS_FRAC) {
     console.warn(
       `  ⚠️  Не увидено ${(missFrac * 100).toFixed(1)}% каталога (${notSeen.length}/${itemsCount}) — ` +
-      'вероятен сбой парсинга. Инкремент и автоперевод пропущены.'
+      'вероятен сбой парсинга. Инкремент streak и автоперевод пропущены.'
     )
-    return { moved: 0, incremented: 0, skippedGuard: true }
+    return { incremented: 0, skippedGuard: true }
   }
 
-  const now   = new Date().toISOString()
+  // PostgREST не умеет x = x + 1 → группируем по текущему значению и патчим пачками.
   const BATCH = 500
-
-  // Инкремент streak невиденным. PostgREST не умеет x = x + 1 → группируем по текущему значению.
-  const byStreak = new Map()   // curStreak -> [ids]
+  const byStreak = new Map()
   for (const r of notSeen) {
     const s = r.drom_miss_streak ?? 0
     if (!byStreak.has(s)) byStreak.set(s, [])
     byStreak.get(s).push(r.id)
   }
-  const toMove = []
   for (const [s, ids] of byStreak) {
     const next = s + 1
     for (let i = 0; i < ids.length; i += BATCH) {
-      const inList = ids.slice(i, i + BATCH).join(',')
-      await supaPatch(supaUrl, key, 'inventory_items', `id=in.(${inList})`, { drom_miss_streak: next })
-    }
-    if (next >= AUTO_MOVE_STREAK) toMove.push(...ids)
-  }
-
-  // Достигшие порога: on_drom → in_stock + строка расхождения + закрыть их missing_from_drom.
-  if (toMove.length > 0) {
-    for (let i = 0; i < toMove.length; i += BATCH) {
-      const slice  = toMove.slice(i, i + BATCH)
-      const inList = slice.join(',')
-      await supaPatch(supaUrl, key, 'inventory_items', `id=in.(${inList})`, { status: 'in_stock' })
-      const rows = slice.map(id => ({
-        inventory_item_id: id,
-        mismatch_type:     'auto_moved_to_stock',
-        detail:            { moved_at: now, reason: `не виден ${AUTO_MOVE_STREAK} круга подряд` },
-      }))
-      await supaPost(supaUrl, key, 'rpc/upsert_drom_mismatches', { rows })
-      await supaPatch(
-        supaUrl, key, 'drom_mismatches',
-        `mismatch_type=eq.missing_from_drom&resolved=eq.false&inventory_item_id=in.(${inList})`,
-        { resolved: true, resolved_at: now }
-      )
+      await supaPatch(supaUrl, key, 'inventory_items', `id=in.(${ids.slice(i, i + BATCH).join(',')})`, { drom_miss_streak: next })
     }
   }
+  return { incremented: notSeen.length, skippedGuard: false }
+}
 
-  return { moved: toMove.length, incremented: notSeen.length, skippedGuard: false }
+// ── Конец круга 2/2: автоперевод снятых с Дрома on_drom → in_stock ─────────────
+// Позиция on_drom, чей drom_miss_streak достиг AUTO_MOVE_STREAK, считается снятой с продажи
+// (объявление удалено), товар на складе есть → in_stock. Инкремент счётчика — в bumpMissStreak
+// (выше, до детекции); ЗДЕСЬ только перевод достигших порога. Накопительные исключены, дочерние
+// (сплиты) включены — у них своё объявление. Каждый перевод фиксируется строкой drom_mismatches
+// 'auto_moved_to_stock' + закрытием missing_from_drom. Гейт AUTO_MOVE_STALE_ENABLED и пропуск при
+// сработавшем предохранителе — в main.
+async function autoMoveStaleItems(supaUrl, key) {
+  const rows = await supaGet(supaUrl, key, 'inventory_items',
+    `select=id&status=eq.on_drom&is_recurring=is.false&drom_miss_streak=gte.${AUTO_MOVE_STREAK}`)
+  const toMove = rows.map(r => r.id)
+  if (toMove.length === 0) return { moved: 0 }
+
+  const now   = new Date().toISOString()
+  const BATCH = 500
+  for (let i = 0; i < toMove.length; i += BATCH) {
+    const slice  = toMove.slice(i, i + BATCH)
+    const inList = slice.join(',')
+    await supaPatch(supaUrl, key, 'inventory_items', `id=in.(${inList})`, { status: 'in_stock' })
+    const rpcRows = slice.map(id => ({
+      inventory_item_id: id,
+      mismatch_type:     'auto_moved_to_stock',
+      detail:            { moved_at: now, reason: `не виден ${AUTO_MOVE_STREAK} круга подряд` },
+    }))
+    await supaPost(supaUrl, key, 'rpc/upsert_drom_mismatches', { rows: rpcRows })
+    await supaPatch(
+      supaUrl, key, 'drom_mismatches',
+      `mismatch_type=eq.missing_from_drom&resolved=eq.false&inventory_item_id=in.(${inList})`,
+      { resolved: true, resolved_at: now }
+    )
+  }
+  return { moved: toMove.length }
 }
 
 // ── Phase 8: Write run log ────────────────────────────────────────────────────
@@ -2113,6 +2143,16 @@ async function main() {
   let mismatchesSold    = 0
   let cycleCollisions   = 0
   if (completedFull) {
+    // Порядок конца круга: (1) инкремент streak → (2) детекция → (3) автоперевод.
+    // (1) Инкремент drom_miss_streak — ВСЕГДА, независимо от флага автоперевода, ДО детекции
+    // (на счётчике держится порог missing >=2). Guard >10% защищает и его.
+    let bump = { incremented: 0, skippedGuard: false }
+    if (!DRY_RUN) {
+      bump = await bumpMissStreak(supaUrl, key, cycleStart, itemsCount)
+      if (!bump.skippedGuard) console.log(`  drom_miss_streak инкрементирован: ${bump.incremented} позиций`)
+    }
+
+    // (2) Детекция расхождений.
     console.log('\n🔍 Поиск расхождений...')
     const result = await detectMismatches(supaUrl, key, cycleStart, { completedAtPage, itemsCount })
     mismatchesMissing = result.missingFromDrom
@@ -2132,17 +2172,16 @@ async function main() {
       console.log(`  Круг завершён, следующий начнётся сразу (${completedNow})`)
     }
 
-    // Пункт 3: автоперевод снятых с Дрома (по умолчанию ВЫКЛ — DROM_AUTO_MOVE_STALE=1 включает).
-    if (!DRY_RUN && AUTO_MOVE_STALE_ENABLED) {
+    // (3) Автоперевод снятых (ВЫКЛ по умолчанию — DROM_AUTO_MOVE_STALE=1). Пропускаем, если
+    // сработал предохранитель инкремента (сбойный круг): счётчик не двигался, двигать нечего.
+    if (!DRY_RUN && AUTO_MOVE_STALE_ENABLED && !bump.skippedGuard) {
       console.log('\n📦 Автоперевод снятых с Дрома (on_drom → in_stock)...')
-      const mv = await autoMoveStaleItems(supaUrl, key, cycleStart, itemsCount)
-      if (mv.skippedGuard) {
-        console.log('  Пропущено предохранителем (>10% каталога не увидено)')
-      } else {
-        console.log(`  Инкремент пропусков: ${mv.incremented}, переведено в in_stock: ${mv.moved}`)
-      }
+      const mv = await autoMoveStaleItems(supaUrl, key)
+      console.log(`  Переведено в in_stock (streak>=${AUTO_MOVE_STREAK}): ${mv.moved}`)
+    } else if (!DRY_RUN && AUTO_MOVE_STALE_ENABLED && bump.skippedGuard) {
+      console.log('  Автоперевод пропущен предохранителем (>10% каталога не увидено)')
     } else if (!AUTO_MOVE_STALE_ENABLED) {
-      console.log('  Автоперевод снятых ВЫКЛ (DROM_AUTO_MOVE_STALE≠1) — обновлены только last_seen/счётчики')
+      console.log('  Автоперевод снятых ВЫКЛ (DROM_AUTO_MOVE_STALE≠1) — счётчик streak обновлён, перевода нет')
     }
   }
 
