@@ -1529,8 +1529,9 @@ async function protectCounter(supaUrl, key) {
 // Relies on last_seen_at timestamps updated incrementally across all blocks of the cycle.
 //   missing_from_drom: on_drom/reserved items whose last_seen_at predates cycleStart
 //                      (not seen anywhere in the current cycle → disappeared from Drom)
-//   sold_but_listed:   sold/returned/written_off items whose last_seen_at >= cycleStart
-//                      (seen during this cycle → still listed despite being closed in CRM)
+//   sold_but_listed:   sold/written_off items seen in this cycle ПОЗЖЕ момента закрытия
+//                      (sold → sales.created_at, written_off → written_off_at). returned исключён:
+//                      возвращённая позиция снова в продаже, объявление для неё правомерно.
 
 async function detectMismatches(supaUrl, key, cycleStart, opts = {}) {
   if (!cycleStart) {
@@ -1565,15 +1566,18 @@ async function detectMismatches(supaUrl, key, cycleStart, opts = {}) {
     `&drom_miss_streak=gte.2`
   )
 
-  // sold_but_listed: кандидаты — терминальные позиции, встреченные в этом круге. Но флаг ставим
-  // ТОЛЬКО если встреча ПОЗЖЕ продажи: круг идёт ~10 ч, увиденное ночью могли продать днём — в
-  // момент встречи расхождения не было (ложные срабатывания в разгар продаж). Для sold сравниваем
-  // с точным sales.created_at (последняя продажа), для returned/written_off — фолбэк на sold_at по дню.
+  // sold_but_listed: терминальная позиция, ВСТРЕЧЕННАЯ в этом круге ПОЗЖЕ момента её закрытия (круг
+  // идёт ~10 ч — увиденное ночью могли закрыть днём, в момент встречи расхождения не было). Сравнение:
+  //   sold        — с точным sales.created_at последней продажи (фолбэк на sold_at по дню, если
+  //                 записи продажи нет);
+  //   written_off — с точным written_off_at;
+  //   returned    — НЕ участвует: возвращённая позиция снова на складе и снова продаётся, объявление
+  //                 на Дроме для неё правомерно — это не расхождение.
   const soldCandidates = await supaGet(
     supaUrl, key,
     'inventory_items',
-    `select=id,status,last_seen_at,sold_at` +
-    `&status=in.(sold,returned,written_off)` +
+    `select=id,status,last_seen_at,sold_at,written_off_at` +
+    `&status=in.(sold,written_off)` +
     `&last_seen_at=not.is.null` +
     `&last_seen_at=gte.${cycleStart}`
   )
@@ -1594,8 +1598,8 @@ async function detectMismatches(supaUrl, key, cycleStart, opts = {}) {
       if (saleTime) return new Date(r.last_seen_at) > new Date(saleTime)   // встречен ПОСЛЕ продажи
       return r.sold_at != null && r.last_seen_at.slice(0, 10) > r.sold_at  // нет записи продажи → по дню
     }
-    // returned / written_off — точного ts нет, фолбэк на sold_at по дню
-    return r.sold_at != null && r.last_seen_at.slice(0, 10) > r.sold_at
+    // written_off — встречен ПОСЛЕ списания (списанное на Дроме висеть не должно)
+    return r.written_off_at != null && new Date(r.last_seen_at) > new Date(r.written_off_at)
   })
 
   const missingFromDrom = missingRows.map(r => ({
