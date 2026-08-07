@@ -1002,59 +1002,13 @@ async function loadCrmSnapshot(supaUrl, key) {
 
 // ── Phase 4: Import new items ─────────────────────────────────────────────────
 
-// Complete deferred parent-child links (from /shipments/new, see pending_parent_links)
-// touching any of the internal_numbers just inserted — as either the child side
-// (parent may already exist) or the parent side (children may already exist).
-// pending_parent_links is expected to stay small (a handful of unresolved manual
-// selections at most), so it's fetched in full rather than filtered by a large
-// IN-list — avoids building huge query strings for 500-item insert batches.
-// Best-effort: never throws, a failure here must not interrupt the sync.
-async function resolvePendingParentLinks(supaUrl, key, newNumbers) {
-  try {
-    const links = await supaGet(
-      supaUrl, key,
-      'pending_parent_links',
-      'select=id,child_internal_number,parent_internal_number'
-    )
-    if (!links.length) return
-
-    const newSet = new Set(newNumbers)
-    const relevant = links.filter(
-      l => newSet.has(l.child_internal_number) || newSet.has(l.parent_internal_number)
-    )
-    if (!relevant.length) return
-
-    const neededNumbers = new Set()
-    for (const l of relevant) {
-      neededNumbers.add(l.child_internal_number)
-      neededNumbers.add(l.parent_internal_number)
-    }
-
-    const idRows = await supaGet(
-      supaUrl, key,
-      'inventory_items',
-      `select=id,internal_number&internal_number=in.(${Array.from(neededNumbers).join(',')})`
-    )
-    const idByNumber = new Map(idRows.map(r => [r.internal_number, r.id]))
-
-    const resolvedIds = []
-    for (const l of relevant) {
-      const childId  = idByNumber.get(l.child_internal_number)
-      const parentId = idByNumber.get(l.parent_internal_number)
-      if (!childId || !parentId) continue // one side still missing — leave the row as-is
-      await supaPatch(supaUrl, key, 'inventory_items', `id=eq.${childId}`, { parent_item_id: parentId })
-      resolvedIds.push(l.id)
-    }
-
-    if (resolvedIds.length > 0) {
-      await supaDelete(supaUrl, key, 'pending_parent_links', `id=in.(${resolvedIds.join(',')})`)
-      console.log(`  ✓ Довершено отложенных родитель-потомок связей: ${resolvedIds.length}`)
-    }
-  } catch (e) {
-    console.warn(`  ⚠️  Не удалось довершить pending_parent_links: ${e.message}`)
-  }
-}
-
+// Отложенные связи родитель↔ребёнок (pending_parent_links) здесь БОЛЬШЕ НЕ РАЗБИРАЮТСЯ.
+// Этим занимается триггер на inventory_items (trg_resolve_pending_parent_links, миграция
+// 20260806180000): он срабатывает на появление карточки ЛЮБЫМ путём — импортом с Дрома,
+// материализацией закупки, ручным созданием, сплитом, — а не только на вставки этого синка,
+// и вдобавок ловит переименование номера. Здешний резолвер видел лишь номера своего прогона.
+// Отдельно важно: он УДАЛЯЛ разрешённые записи (и делал это без фильтра по status, то есть
+// сносил и строки 'conflict'), тогда как решено хранить историю — триггер метит 'resolved'.
 async function importNewItems(supaUrl, key, newItems, crmSnapshot) {
   if (!newItems.length) return { count: 0, slashLinked: 0, pendingResolved: 0 }
   const BATCH = 500
@@ -1148,7 +1102,6 @@ async function importNewItems(supaUrl, key, newItems, crmSnapshot) {
         batch,
         'resolution=ignore-duplicates,return=minimal'
       )
-      await resolvePendingParentLinks(supaUrl, key, batch.map(r => r.internal_number))
     } else {
       const pendingInBatch = batch.filter(r => r.purchase_price !== null).length
       console.log(`  (DRY RUN) Batch ${Math.floor(i / BATCH) + 1}: ${batch.length} новых, из них с pending: ${pendingInBatch}`)
